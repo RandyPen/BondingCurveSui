@@ -1,6 +1,15 @@
 # BondingCurveSui
 
-A PumpFun-style token launchpad on Sui Move — a clean rewrite inspired by moonbags-contracts-sui, with different requirements and several structural optimizations.
+**A bonding-curve launchpad TEMPLATE for Sui Move.** This repository is a production-grade, audited reference implementation of a PumpFun-style token launchpad — fork it, adjust the tokenomics knobs, and ship your own launchpad. It is a clean rewrite inspired by moonbags-contracts-sui, with different requirements and several structural optimizations.
+
+What you get out of the box:
+
+- a complete on-chain lifecycle (launch → bonding-curve trading → Cetus CLMM full-range migration → LP burn → fee sharing), 75 unit tests including real CLMM pool creation;
+- every business number is an admin-configurable parameter, not a hardcoded constant: supply split, per-quote graduation thresholds, fees and platform/creator splits, lock minimums, market-cap unlock multiplier — see `deployments.json` for a worked production parameter set;
+- developer skills (`skills/`) covering data indexing/K-lines, trading PTBs, agent-driven token launches, and platform keeper operations;
+- a documented trust model and known trade-offs (below), so you know exactly what you are shipping.
+
+Typical customization points when forking: fee-split recipients (e.g. route the treasury share to a staking or buyback contract), additional tranche unlock-condition kinds in `pool.move` (time and market-cap are implemented), quote whitelist policy, and the frontend/keeper layer. The contracts are chain-complete with no privileged off-chain component beyond the two recommended keepers.
 
 ## Core features
 
