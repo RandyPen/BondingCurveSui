@@ -74,6 +74,10 @@ module bondingcurvesui::lifecycle_tests {
             cap,
             mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
             option::none(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
             tranche_quote_in,
             tranche_lock_kind,
             tranche_lock_param,
@@ -147,7 +151,9 @@ module bondingcurvesui::lifecycle_tests {
         // Supply is fixed at I + R and burn-only.
         assert!(coin_registry::is_supply_burn_only(&currency));
         assert!(coin_registry::total_supply(&currency) == option::some(I + R));
-        assert!(coin_registry::is_metadata_cap_deleted(&currency));
+        // The MetadataCap is held by the pool (not deleted): the creator
+        // keeps metadata-update rights.
+        assert!(coin_registry::is_metadata_cap_claimed(&currency));
 
         scenario.next_tx(CREATOR);
         {
@@ -242,6 +248,10 @@ module bondingcurvesui::lifecycle_tests {
             cap,
             mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
             option::none(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
             vector[],
             vector[],
             vector[],
@@ -287,6 +297,10 @@ module bondingcurvesui::lifecycle_tests {
             cap,
             mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE - 1, scenario.ctx()),
             option::none(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
             vector[],
             vector[],
             vector[],
@@ -661,6 +675,113 @@ module bondingcurvesui::lifecycle_tests {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             pool::unlock_tranche_time(&mut pool, 0, &clock);
             pool::unlock_tranche_time(&mut pool, 0, &clock);
+            ts::return_shared(pool);
+        };
+        end(scenario, clock, currency);
+    }
+
+    // === Project info ===
+
+    #[test]
+    fun creator_can_update_project_info() {
+        let (mut scenario, clock) = setup();
+        let currency = create_test_token(
+            &mut scenario, &clock, vector[], vector[], vector[], 0,
+        );
+        scenario.next_tx(CREATOR);
+        {
+            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+            pool::update_project_info(
+                &mut pool,
+                b"a meme with a plan".to_string(),
+                b"https://x.com/meme".to_string(),
+                b"https://t.me/meme".to_string(),
+                b"https://meme.xyz".to_string(),
+                scenario.ctx(),
+            );
+            let (description, twitter, telegram, website) = pool.project_info();
+            assert!(description == b"a meme with a plan".to_string());
+            assert!(twitter == b"https://x.com/meme".to_string());
+            assert!(telegram == b"https://t.me/meme".to_string());
+            assert!(website == b"https://meme.xyz".to_string());
+            ts::return_shared(pool);
+        };
+        end(scenario, clock, currency);
+    }
+
+    #[test, expected_failure(abort_code = pool::EProjectInfoTooLong)]
+    fun project_info_rejects_oversized_link() {
+        let (mut scenario, clock) = setup();
+        let currency = create_test_token(
+            &mut scenario, &clock, vector[], vector[], vector[], 0,
+        );
+        scenario.next_tx(CREATOR);
+        {
+            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+            let mut long = b"".to_string();
+            let mut i = 0u64;
+            while (i < 501) {
+                long.append(b"x".to_string());
+                i = i + 1;
+            };
+            pool::update_project_info(
+                &mut pool,
+                b"".to_string(),
+                long,
+                b"".to_string(),
+                b"".to_string(),
+                scenario.ctx(),
+            );
+            ts::return_shared(pool);
+        };
+        end(scenario, clock, currency);
+    }
+
+    // === Creator metadata updates ===
+
+    #[test]
+    fun creator_can_update_metadata() {
+        let (mut scenario, clock) = setup();
+        let mut currency = create_test_token(
+            &mut scenario, &clock, vector[], vector[], vector[], 0,
+        );
+        scenario.next_tx(CREATOR);
+        {
+            let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+            pool::update_base_metadata(
+                &pool,
+                &mut currency,
+                option::some(b"Renamed Coin".to_string()),
+                option::none(),
+                option::some(b"https://example.com/icon.png".to_string()),
+                scenario.ctx(),
+            );
+            ts::return_shared(pool);
+        };
+        assert!(coin_registry::name(&currency) == b"Renamed Coin".to_string());
+        assert!(coin_registry::icon_url(&currency) == b"https://example.com/icon.png".to_string());
+        // Untouched field keeps its original value.
+        assert!(coin_registry::description(&currency) == b"launchpad test base coin".to_string());
+        end(scenario, clock, currency);
+    }
+
+    #[test, expected_failure(abort_code = pool::ENotCreator)]
+    fun non_creator_cannot_update_metadata() {
+        let (mut scenario, clock) = setup();
+        let mut currency = create_test_token(
+            &mut scenario, &clock, vector[], vector[], vector[], 0,
+        );
+        scenario.next_tx(TRADER);
+        {
+            let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+            pool::update_base_metadata(
+                &pool,
+                &mut currency,
+                option::some(b"Hijacked".to_string()),
+                option::none(),
+                option::none(),
+                scenario.ctx(),
+            );
             ts::return_shared(pool);
         };
         end(scenario, clock, currency);

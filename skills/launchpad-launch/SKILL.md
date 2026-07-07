@@ -69,6 +69,8 @@ pool::create_token<Base, Quote>(
     treasury_cap: TreasuryCap<Base>,       // consumed: supply becomes burn-only
     creation_fee: Coin<Quote>,             // EXACT amount (QuoteParams.creation_fee)
     threshold: Option<u64>,                // none => per-quote default
+    description: String,                   // project info, empty = unset
+    twitter: String, telegram: String, website: String, // <= 1000/500/500/500 chars
     tranche_quote_in: vector<u64>,         // creator first-buy tranches (<= 16)
     tranche_lock_kind: vector<u8>,         // 0 = time lock, 1 = market-cap target
     tranche_lock_param: vector<u64>,       // unlock_ts_ms | market cap in quote units
@@ -94,6 +96,10 @@ const change = tx.moveCall({
     tx.object(treasuryCapId),
     creationFee,
     tx.pure.option('u64', null),                       // threshold: default
+    tx.pure.string('a meme with a plan'),              // description
+    tx.pure.string('https://x.com/meme'),              // twitter
+    tx.pure.string(''),                                // telegram (unset)
+    tx.pure.string('https://meme.xyz'),                // website
     tx.pure.vector('u64', [100_000_000n]),             // one tranche, 100 quote gross
     tx.pure.vector('u8', [0]),                         // time lock
     tx.pure.vector('u64', [BigInt(Date.now()) + 86_400_000n]), // unlock in 24h
@@ -108,7 +114,7 @@ tx.transferObjects([change], sender);
 
 From the result: `PoolCreatedEvent.pool_id` (persist it), `TrancheLockedEvent` per tranche (`quote_in` = actual spend after any completing-buy refund), `TradedEvent` for each tranche buy.
 
-What tx3 does besides minting: reserves the Cetus pool key (permission pair — nobody can front-run the future migration), deletes the metadata cap (metadata frozen forever), converts supply to burn-only (anyone can burn via the Currency; total supply on-chain, mint impossible).
+What tx3 does besides minting: reserves the Cetus pool key (permission pair — nobody can front-run the future migration), claims the MetadataCap into the pool (the creator can update name/description/icon later via `pool::update_base_metadata(pool, currency, name?, description?, icon_url?)`; symbol immutable), converts supply to burn-only (anyone can burn via the Currency; total supply on-chain, mint impossible).
 
 ## After launch (agent lifecycle)
 

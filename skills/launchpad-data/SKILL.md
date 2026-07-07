@@ -12,7 +12,7 @@ Object IDs live in `deployments.json` at the repo root (`launchpadPackage`, `lau
 - **Global events** are plain types; one filter enumerates everything.
   `PoolCreatedEvent` (module `pool`) carries the coin pair as `TypeName` **fields** (`base`, `quote`) plus `pool_id`, `creator`, `threshold`, initial virtual reserves.
 - **Pool-scoped events** are **generic over the pair** `<Base, Quote>`, so one fully-instantiated type filter subscribes to exactly one token:
-  - module `pool`: `TradedEvent`, `CurveCompletedEvent`, `CurveFeesDistributedEvent`, `TrancheLockedEvent`, `TrancheUnlockedEvent`, `EmergencyWithdrawEvent`
+  - module `pool`: `TradedEvent`, `CurveCompletedEvent`, `CurveFeesDistributedEvent`, `TrancheLockedEvent`, `TrancheUnlockedEvent`, `ProjectInfoUpdatedEvent`
   - module `migration`: `MigratedEvent`, `LpFeesClaimedEvent`, `TvlTrancheUnlockedEvent`, `LpRewardsClaimedEvent`
 
 Type filter string format (JSON-RPC `MoveEventType` requires the full instantiation):
@@ -34,7 +34,8 @@ const page = await client.queryEvents({
   order: 'descending', limit: 50, cursor,
 });
 // parsedJson: { pool_id, base: {name}, quote: {name}, creator, threshold,
-//               virtual_base, virtual_quote, curve_fee_bps, tick_spacing }
+//               virtual_base, virtual_quote, curve_fee_bps, tick_spacing,
+//               project: { description, twitter, telegram, website } }
 ```
 
 `base.name`/`quote.name` are full type names without the leading `0x` prefix convention of TypeName (e.g. `abc..::mycoin::MYCOIN`) — prepend `0x` when building type filters from them.
@@ -44,6 +45,8 @@ const page = await client.queryEvents({
 ```ts
 const obj = await client.getObject({ id: poolId, options: { showContent: true } });
 // fields: phase (0 TRADING / 1 COMPLETED / 2 MIGRATED),
+// project { description, twitter, telegram, website } (creator-updatable,
+// watch ProjectInfoUpdatedEvent<Base, Quote> for changes),
 // virtual_base, virtual_quote, virtual_base_floor, threshold,
 // base_reserve, lp_base_reserve, quote_reserve (progress bar = quote_reserve / threshold),
 // platform_fees, creator_fees, curve_fee_bps, tranches[], creator,

@@ -12,11 +12,13 @@ module bondingcurvesui::pool {
     use cetus_clmm::config::GlobalConfig as CetusGlobalConfig;
     use cetus_clmm::factory::{Self, Pools as CetusPools, PoolCreationCap};
     use lp_burn::lp_burn::CetusLPBurnProof;
+    use std::string::String;
     use std::type_name::{Self, TypeName};
     use sui::balance::{Self, Balance};
     use sui::clock::Clock;
     use sui::coin::{Self, Coin, TreasuryCap};
-    use sui::coin_registry::{Self, Currency};
+    use sui::coin_registry::{Self, Currency, MetadataCap};
+    use sui::dynamic_object_field as dof;
     use sui::event;
 
     use bondingcurvesui::config::{Self, AdminCap, LaunchpadConfig};
@@ -69,11 +71,17 @@ module bondingcurvesui::pool {
     // parties).
     /// Base coin is a regulated currency (has a deny cap).
     const ERegulatedBase: u64 = 23;
+    /// Caller is not the pool creator.
+    const ENotCreator: u64 = 24;
+    /// A project-info field exceeds its length limit.
+    const EProjectInfoTooLong: u64 = 25;
 
     // === Constants ===
 
     const VERSION: u64 = 1;
     const MAX_TRANCHES: u64 = 16;
+    const MAX_DESCRIPTION_LEN: u64 = 1000;
+    const MAX_LINK_LEN: u64 = 500;
 
     // Lifecycle phases.
     const PHASE_TRADING: u8 = 0;
@@ -85,6 +93,19 @@ module bondingcurvesui::pool {
     const LOCK_KIND_TVL: u8 = 1;
 
     // === Structs ===
+
+    /// Dynamic-object-field key for the MetadataCap held by the pool.
+    public struct MetadataCapKey has copy, drop, store {}
+
+    /// Project links and description, shown on token pages. A plain pool
+    /// field (not a dynamic field) so a single getObject returns it.
+    /// Empty strings mean unset.
+    public struct ProjectInfo has store, copy, drop {
+        description: String,
+        twitter: String,
+        telegram: String,
+        website: String,
+    }
 
     /// A creator first-buy tranche, locked until its unlock condition holds.
     public struct CreatorTranche<phantom Base> has store {
@@ -126,6 +147,8 @@ module bondingcurvesui::pool {
         lp_fee_platform_bps: u64,
         tick_spacing: u32,
         min_buy_amount: u64,
+        /// Project description and social links; creator-updatable.
+        project: ProjectInfo,
         // Creator first-buy tranches.
         tranches: vector<CreatorTranche<Base>>,
         /// Reserves the (Base, Quote, tick_spacing) Cetus pool key at launch
@@ -152,6 +175,12 @@ module bondingcurvesui::pool {
         virtual_quote: u64,
         curve_fee_bps: u64,
         tick_spacing: u32,
+        project: ProjectInfo,
+    }
+
+    public struct ProjectInfoUpdatedEvent<phantom Base, phantom Quote> has copy, drop {
+        pool_id: ID,
+        project: ProjectInfo,
     }
 
     public struct TrancheLockedEvent<phantom Base, phantom Quote> has copy, drop {
@@ -207,9 +236,10 @@ module bondingcurvesui::pool {
     /// - `coin_registry::migrate_legacy_metadata` has created the shared
     ///   `Currency<Base>`.
     ///
-    /// This function mints the fixed total supply, permanently freezes the
-    /// currency metadata, converts the supply to burn-only (consuming the
-    /// treasury cap), reserves the future Cetus pool key (mints a
+    /// This function mints the fixed total supply, takes custody of the
+    /// MetadataCap (the creator keeps metadata-update rights through
+    /// update_base_metadata), converts the supply to burn-only (consuming
+    /// the treasury cap), reserves the future Cetus pool key (mints a
     /// PoolCreationCap and registers the permission pair, so nobody can
     /// front-run migration by creating the pool first), optionally executes
     /// creator first-buy tranches, and shares the pool. Returns the change
@@ -224,6 +254,10 @@ module bondingcurvesui::pool {
         treasury_cap: TreasuryCap<Base>,
         creation_fee: Coin<Quote>,
         threshold: Option<u64>,
+        description: String,
+        twitter: String,
+        telegram: String,
+        website: String,
         tranche_quote_in: vector<u64>,
         tranche_lock_kind: vector<u8>,
         tranche_lock_param: vector<u64>,
@@ -283,10 +317,11 @@ module bondingcurvesui::pool {
             ctx,
         );
 
-        // Freeze metadata forever, then give up mint authority: supply
-        // becomes burn-only through the shared Currency object.
+        // Take custody of the MetadataCap (stored in the pool below, so the
+        // creator keeps the right to update name/description/icon through
+        // update_base_metadata), then give up mint authority: supply becomes
+        // burn-only through the shared Currency object.
         let metadata_cap = coin_registry::claim_metadata_cap(currency, &treasury_cap, ctx);
-        coin_registry::delete_metadata_cap(currency, metadata_cap);
         coin_registry::make_supply_burn_only(currency, treasury_cap);
 
         let (virtual_base, virtual_quote, virtual_base_floor) =
@@ -311,6 +346,7 @@ module bondingcurvesui::pool {
             lp_fee_platform_bps: cfg.lp_fee_platform_bps(),
             tick_spacing: cfg.tick_spacing(),
             min_buy_amount: quote_params.quote_min_buy_amount(),
+            project: new_project_info(description, twitter, telegram, website),
             tranches: vector[],
             pool_creation_cap,
             completed_at_ms: 0,
@@ -319,6 +355,7 @@ module bondingcurvesui::pool {
             burn_proof: option::none(),
         };
         let pool_id = pool.id.to_inner();
+        dof::add(&mut pool.id, MetadataCapKey {}, metadata_cap);
 
         event::emit(PoolCreatedEvent {
             pool_id,
@@ -330,6 +367,7 @@ module bondingcurvesui::pool {
             virtual_quote,
             curve_fee_bps: pool.curve_fee_bps,
             tick_spacing: pool.tick_spacing,
+            project: pool.project,
         });
 
         // Creator first-buy tranches. A market-cap target below
@@ -365,6 +403,10 @@ module bondingcurvesui::pool {
         treasury_cap: TreasuryCap<Base>,
         creation_fee: Coin<Quote>,
         threshold: Option<u64>,
+        description: String,
+        twitter: String,
+        telegram: String,
+        website: String,
         tranche_quote_in: vector<u64>,
         tranche_lock_kind: vector<u8>,
         tranche_lock_param: vector<u64>,
@@ -380,6 +422,10 @@ module bondingcurvesui::pool {
             treasury_cap,
             creation_fee,
             threshold,
+            description,
+            twitter,
+            telegram,
+            website,
             tranche_quote_in,
             tranche_lock_kind,
             tranche_lock_param,
@@ -659,6 +705,81 @@ module bondingcurvesui::pool {
             creator,
         });
         balance::send_funds(unlocked, creator);
+    }
+
+    // === Project info ===
+
+    /// Creator-only: replace the pool's project description and links.
+    public fun update_project_info<Base, Quote>(
+        pool: &mut Pool<Base, Quote>,
+        description: String,
+        twitter: String,
+        telegram: String,
+        website: String,
+        ctx: &TxContext,
+    ) {
+        pool.assert_pool_version();
+        assert!(ctx.sender() == pool.creator, ENotCreator);
+        pool.project = new_project_info(description, twitter, telegram, website);
+        event::emit(ProjectInfoUpdatedEvent<Base, Quote> {
+            pool_id: pool.id.to_inner(),
+            project: pool.project,
+        });
+    }
+
+    fun new_project_info(
+        description: String,
+        twitter: String,
+        telegram: String,
+        website: String,
+    ): ProjectInfo {
+        assert!(description.length() <= MAX_DESCRIPTION_LEN, EProjectInfoTooLong);
+        assert!(twitter.length() <= MAX_LINK_LEN, EProjectInfoTooLong);
+        assert!(telegram.length() <= MAX_LINK_LEN, EProjectInfoTooLong);
+        assert!(website.length() <= MAX_LINK_LEN, EProjectInfoTooLong);
+        ProjectInfo { description, twitter, telegram, website }
+    }
+
+    /// Returns `(description, twitter, telegram, website)`.
+    public fun project_info<Base, Quote>(
+        pool: &Pool<Base, Quote>,
+    ): (String, String, String, String) {
+        (
+            pool.project.description,
+            pool.project.twitter,
+            pool.project.telegram,
+            pool.project.website,
+        )
+    }
+
+    // === Metadata management ===
+
+    /// Creator-only: update the launched coin's metadata through the
+    /// MetadataCap held by the pool. The symbol is immutable in
+    /// coin_registry; pass none for fields to leave unchanged.
+    public fun update_base_metadata<Base, Quote>(
+        pool: &Pool<Base, Quote>,
+        currency: &mut Currency<Base>,
+        mut name: Option<String>,
+        mut description: Option<String>,
+        mut icon_url: Option<String>,
+        ctx: &TxContext,
+    ) {
+        pool.assert_pool_version();
+        assert!(ctx.sender() == pool.creator, ENotCreator);
+        let cap = dof::borrow<MetadataCapKey, MetadataCap<Base>>(&pool.id, MetadataCapKey {});
+        if (name.is_some()) {
+            coin_registry::set_name(currency, cap, name.extract());
+        };
+        if (description.is_some()) {
+            coin_registry::set_description(currency, cap, description.extract());
+        };
+        if (icon_url.is_some()) {
+            coin_registry::set_icon_url(currency, cap, icon_url.extract());
+        };
+        name.destroy_none();
+        description.destroy_none();
+        icon_url.destroy_none();
     }
 
     // === Views ===
