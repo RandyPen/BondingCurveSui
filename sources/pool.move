@@ -64,10 +64,9 @@ module bondingcurvesui::pool {
     const ESupplyNotBurnOnly: u64 = 19;
     /// Pool has not migrated yet.
     const ENotMigrated: u64 = 20;
-    /// Emergency withdrawal grace period has not elapsed.
-    const EGracePeriodActive: u64 = 21;
-    /// Pool is not halted.
-    const ENotHalted: u64 = 22;
+    // Codes 21/22 retired (emergency backstop removed: the Cetus pool key
+    // is reserved at launch, so migration cannot be blocked by third
+    // parties).
     /// Base coin is a regulated currency (has a deny cap).
     const ERegulatedBase: u64 = 23;
 
@@ -75,17 +74,11 @@ module bondingcurvesui::pool {
 
     const VERSION: u64 = 1;
     const MAX_TRANCHES: u64 = 16;
-    /// A completed pool must stay unmigratable this long before the admin
-    /// backstop can move its funds (migration normally takes seconds).
-    const EMERGENCY_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
     // Lifecycle phases.
     const PHASE_TRADING: u8 = 0;
     const PHASE_COMPLETED: u8 = 1;
     const PHASE_MIGRATED: u8 = 2;
-    /// Terminal failure state: migration was impossible and the admin
-    /// backstop drained the pool after the grace period.
-    const PHASE_HALTED: u8 = 3;
 
     // Creator-tranche lock kinds.
     const LOCK_KIND_TIME: u8 = 0;
@@ -138,7 +131,8 @@ module bondingcurvesui::pool {
         /// Reserves the (Base, Quote, tick_spacing) Cetus pool key at launch
         /// so nobody can front-run the migration's pool creation.
         pool_creation_cap: PoolCreationCap,
-        /// Clock time when the curve completed (0 while trading).
+        /// Clock time when the curve completed (0 while trading);
+        /// informational, for indexers.
         completed_at_ms: u64,
         // Post-migration state.
         cetus_pool_id: Option<ID>,
@@ -202,12 +196,6 @@ module bondingcurvesui::pool {
         index: u64,
         amount: u64,
         creator: address,
-    }
-
-    public struct EmergencyWithdrawEvent<phantom Base, phantom Quote> has copy, drop {
-        pool_id: ID,
-        base_amount: u64,
-        quote_amount: u64,
     }
 
     // === Token creation ===
@@ -673,64 +661,6 @@ module bondingcurvesui::pool {
         balance::send_funds(unlocked, creator);
     }
 
-    // === Emergency backstop ===
-
-    /// Backstop for a completed pool stuck unmigrated for 7 days (e.g. the
-    /// Cetus fee tier for its tick_spacing disappeared): the admin may drain
-    /// it to the treasury for off-chain restitution, moving the pool to the
-    /// terminal HALTED phase.
-    ///
-    /// TRUST NOTE: on-chain this only checks "COMPLETED + 7 days elapsed" —
-    /// it cannot prove migration is actually impossible. The counterweight
-    /// is that `migrate` is permissionless and unpausable, so anyone can
-    /// preempt the drain with a single transaction at any point in the
-    /// grace window; the platform must run a keeper that cranks `migrate`
-    /// on every CurveCompletedEvent, making this window moot in practice.
-    public fun emergency_withdraw<Base, Quote>(
-        _: &AdminCap,
-        cfg: &LaunchpadConfig,
-        pool: &mut Pool<Base, Quote>,
-        clock: &Clock,
-    ) {
-        cfg.assert_version();
-        let (base, quote) = withdraw_for_migration(pool); // asserts COMPLETED
-        assert!(
-            clock.timestamp_ms() >= pool.completed_at_ms + EMERGENCY_GRACE_MS,
-            EGracePeriodActive,
-        );
-        pool.phase = PHASE_HALTED;
-        event::emit(EmergencyWithdrawEvent<Base, Quote> {
-            pool_id: pool.id.to_inner(),
-            base_amount: base.value(),
-            quote_amount: quote.value(),
-        });
-        balance::send_funds(base, cfg.treasury());
-        balance::send_funds(quote, cfg.treasury());
-        distribute_curve_fees(cfg, pool);
-    }
-
-    /// In the terminal HALTED phase the pool will never migrate, so TVL
-    /// conditions are unsatisfiable; every remaining tranche becomes
-    /// claimable (permissionless trigger, funds go to the creator).
-    public fun unlock_tranche_halted<Base, Quote>(
-        pool: &mut Pool<Base, Quote>,
-        index: u64,
-    ) {
-        pool.assert_pool_version();
-        assert!(pool.phase == PHASE_HALTED, ENotHalted);
-        let creator = pool.creator;
-        let pool_id = pool.id.to_inner();
-        let tranche = pool.borrow_tranche_mut(index);
-        let unlocked = take_tranche(tranche);
-        event::emit(TrancheUnlockedEvent<Base, Quote> {
-            pool_id,
-            index,
-            amount: unlocked.value(),
-            creator,
-        });
-        balance::send_funds(unlocked, creator);
-    }
-
     // === Views ===
 
     /// Quotes a buy: returns `(base_out, fee)` for a gross quote input, or
@@ -824,8 +754,6 @@ module bondingcurvesui::pool {
     public fun phase_completed(): u8 { PHASE_COMPLETED }
 
     public fun phase_migrated(): u8 { PHASE_MIGRATED }
-
-    public fun phase_halted(): u8 { PHASE_HALTED }
 
     public fun completed_at_ms<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
         pool.completed_at_ms
@@ -987,10 +915,4 @@ module bondingcurvesui::pool {
         (ev.amount, ev.creator)
     }
 
-    #[test_only]
-    public fun emergency_withdraw_event_amounts<Base, Quote>(
-        ev: &EmergencyWithdrawEvent<Base, Quote>,
-    ): (u64, u64) {
-        (ev.base_amount, ev.quote_amount)
-    }
 }

@@ -4,7 +4,7 @@
 
 What you get out of the box:
 
-- a complete on-chain lifecycle (launch → bonding-curve trading → Cetus CLMM full-range migration → LP burn → fee sharing), 75 unit tests including real CLMM pool creation;
+- a complete on-chain lifecycle (launch → bonding-curve trading → Cetus CLMM full-range migration → LP burn → fee sharing), 72 unit tests including real CLMM pool creation;
 - every business number is an admin-configurable parameter, not a hardcoded constant: supply split, per-quote graduation thresholds, fees and platform/creator splits, lock minimums, market-cap unlock multiplier — see `deployments.json` for a worked production parameter set;
 - developer skills (`skills/`) covering data indexing/K-lines, trading PTBs, agent-driven token launches, and platform keeper operations;
 - a documented trust model and known trade-offs (below), so you know exactly what you are shipping.
@@ -17,7 +17,7 @@ Typical customization points when forking: fee-split recipients (e.g. route the 
 - **Quote coin whitelist**: admin-managed (`add_quote<Quote>` / `set_quote_enabled`), with per-quote graduation threshold, creation fee, minimum buy, and minimum market-cap unlock target. Pools are generic: `Pool<Base, Quote>`.
 - **Single graduation path**: once the curve drains, anyone can trigger `migrate`; all liquidity enters Cetus CLMM as a **full-range** position (`full_range_tick_range`), with the coin A/B assignment branched at runtime on the ASCII order of the type names.
 - **Front-run protection for pool creation (critical)**: while the TreasuryCap is still held at launch (zero supply, nobody owns base coins yet), `create_token` mints a Cetus `PoolCreationCap` and calls `register_permission_pair`; migration uses `create_pool_v3_with_creation_cap`. Without this, an attacker with dust amounts could create the `(Base, Quote, tick_spacing)` pool first and permanently brick migration with `EPoolAlreadyExist`, stranding all raised funds (found in security review; fixed with regression tests). **Operational precondition**: every whitelisted quote must be allowed in Cetus's `allowed_pair_config` for the configured tick_spacing, otherwise launches abort. Status: Cetus has confirmed (2026-07-07) that **SUI and USDC** are allowed for permission-pair creation at the 1% fee tier (tick_spacing 200); additional quotes require Cetus's pool manager to run `add_allowed_pair_config`.
-- **Emergency backstop**: a pool stuck in COMPLETED for **7 days** can be drained by the admin via `emergency_withdraw` (funds to treasury, pool enters the terminal HALTED phase, event logged); in HALTED every tranche becomes permissionlessly releasable to the creator (market-cap conditions are permanently unsatisfiable). **Trust note**: on-chain this only checks "COMPLETED + 7 days" — it cannot prove migration is impossible. The counterweight: `migrate` is permissionless and unpausable, so anyone can preempt the drain with one transaction; the platform must run a keeper that migrates on every `CurveCompletedEvent`, making the window moot in practice.
+- **No admin access to pool funds — ever**: with the pool key reserved at launch, migration cannot be blocked by third parties, so there is no emergency-withdraw backstop and no code path by which the admin can touch pool reserves in any phase. The residual (accepted) risk is Cetus-governance action against a specific coin (deny-listing, fee-tier removal), documented under Known trade-offs.
 - **Launch parameter guard rails**: `set_launch_params` enforces `initial/remain ≤ 1000` so extreme ratios cannot push the CLMM seed price outside Cetus's representable range and permanently block migration.
 - **LP burn**: after migration the position is burned through Cetus's official `lp_burn::burn_lp_v2`; the `CetusLPBurnProof` is held by the protocol (inside the pool object). Anyone can trigger `claim_lp_fees` — the quote side is split between platform treasury and creator by configurable bps, the **base side is always burned**.
 - **Currency (BurnOnly)**: at launch, after minting the fixed supply (default 800M curve + 200M LP = 1B total, 6 decimals), the metadata cap is claimed and deleted (metadata frozen forever) and `make_supply_burn_only` consumes the TreasuryCap. Anyone can then burn base coins via the shared `Currency<T>`; total supply stays on-chain queryable and minting is impossible.
@@ -28,7 +28,7 @@ Typical customization points when forking: fee-split recipients (e.g. route the 
 - **Cetus incentive claiming**: `claim_lp_rewards{,_inverted}<Base, Quote, Reward>` collects rewarder incentives via `lp_burn::collect_reward`, split platform/creator by `lp_fee_platform_bps` (without this they would be stranded forever).
 - **One shared object per pool**: trades on different tokens never contend; the global `LaunchpadConfig` only keeps a `Base type → pool ID` registry (prevents duplicate launches).
 - **AdminCap is `key`-only**: cannot be `public_transfer`red or wrapped; the only way to move it is `transfer_admin`.
-- **Address-balance payouts**: every outbound payment (creation fee, curve-fee distribution, LP fees/rewards, tranche unlocks, emergency withdraw, entry-wrapper outputs) is credited via `balance::send_funds` to the recipient's **address balance (funds accumulator)** instead of creating Coin objects — no object proliferation, and funds sent within a transaction cannot be spent in that same transaction. Recipients (treasury multisig, creators) need address-balance-aware wallets/SDK (`Withdrawal` reservation + `balance::redeem_funds`). The `buy`/`sell` public functions still RETURN Coin values for PTB composability.
+- **Address-balance payouts**: every outbound payment (creation fee, curve-fee distribution, LP fees/rewards, tranche unlocks, entry-wrapper outputs) is credited via `balance::send_funds` to the recipient's **address balance (funds accumulator)** instead of creating Coin objects — no object proliferation, and funds sent within a transaction cannot be spent in that same transaction. Recipients (treasury multisig, creators) need address-balance-aware wallets/SDK (`Withdrawal` reservation + `balance::redeem_funds`). The `buy`/`sell` public functions still RETURN Coin values for PTB composability.
 
 ## Lifecycle (3-transaction launch)
 
@@ -59,7 +59,7 @@ To auto-load them as Claude Code project skills, symlink or copy the directories
 
 ```bash
 sui move build
-sui move test   # 75 tests
+sui move test   # 72 tests
 ```
 
 Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR resolves on mainnet (cetus-contracts @ clmm-v14 — real sources, so unit tests create real CLMM pools); the lp_burn interface is vendored locally (`vendor/lp_burn`) to drop its clmm_vester transitive dependency, whose MVR resolution fails outside mainnet.
@@ -75,10 +75,12 @@ Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR res
 5. **On-chain smoke test**: launch a test coin through the 3 transactions → small buys/sells → drain → `migrate` (verify the Cetus pool price and burn proof) → `claim_lp_fees` round trip → `coin_registry::burn` reduces supply.
 6. **Upgrades**: after a package upgrade call `bump_config_version`, and `bump_pool_version` per live pool as needed.
 7. **Two mandatory keepers**:
-   - Migration keeper: listen for `CurveCompletedEvent` and call `migrate` immediately (also neutralizes the 7-day emergency window);
+   - Migration keeper: listen for `CurveCompletedEvent` and call `migrate` immediately (frontends can also attach `migrate` to the drain buy atomically);
    - Regulated-marking keeper: watch for newly published frozen `RegulatedCoinMetadata<T>` objects and call `migrate_regulated_state_by_metadata` to permanently mark regulated coins before they can launch.
 
 ## Known trade-offs
+
+- There is **no emergency withdrawal**: if Cetus governance deny-lists a launched coin or removes the pool's fee tier before migration, that pool's raised funds are permanently stuck (accepted by design — the alternative, an admin backstop, was removed because it gave the admin a theoretical path to drain healthy pools; the permission-pair reservation eliminates all third-party migration-blocking).
 
 - Cross-transaction price manipulation of the market-cap unlock has no two-step confirmation (accepted for v1: the only beneficiary is the creator; cost is 2× pool fees + slippage + arbitrage risk; the event records the sqrt price, circulating supply and computed market cap for auditability). A v1.1 hardening could add a poke → confirm-after-N-hours flow.
 - A regulated coin's `Unknown` state cannot be refuted on-chain (the framework has no "prove no DenyCap exists" predicate); the on-chain assert only blocks revealed Regulated states — the rest of the loop is closed by the regulated-marking keeper (see deployment checklist).

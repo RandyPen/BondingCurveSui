@@ -43,7 +43,7 @@ const page = await client.queryEvents({
 
 ```ts
 const obj = await client.getObject({ id: poolId, options: { showContent: true } });
-// fields: phase (0 TRADING / 1 COMPLETED / 2 MIGRATED / 3 HALTED),
+// fields: phase (0 TRADING / 1 COMPLETED / 2 MIGRATED),
 // virtual_base, virtual_quote, virtual_base_floor, threshold,
 // base_reserve, lp_base_reserve, quote_reserve (progress bar = quote_reserve / threshold),
 // platform_fees, creator_fees, curve_fee_bps, tranches[], creator,

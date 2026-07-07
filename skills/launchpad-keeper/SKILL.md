@@ -20,7 +20,7 @@ migration::migrate<Base, Quote>(cfg, pool, currency, burn_manager,
 
 Resolve `Base/Quote` from the pool object's type. This creates the full-range Cetus pool at the curve's end price, burns the LP via lp_burn (proof stored in the pool), burns base dust, flushes curve fees, and flips the pool to `MIGRATED`. Idempotent-safe: a second call aborts (`ENotCompleted`).
 
-Why mandatory: frontends may also attach `migrate` to the drain buy atomically (see `launchpad-trade`), but the keeper is the backstop that keeps the completion→migration window at seconds. It also makes the admin `emergency_withdraw` (COMPLETED + 7 days) practically unreachable — which is the intended trust posture.
+Why mandatory: frontends may also attach `migrate` to the drain buy atomically (see `launchpad-trade`), but the keeper is the backstop that keeps the completion→migration window at seconds.
 
 ## Keeper 2 — mark regulated coins (MANDATORY)
 
@@ -39,7 +39,6 @@ There is no griefing vector: only coins that actually have a `RegulatedCoinMetad
 - `migration::claim_lp_rewards<Base, Quote, Reward>(cfg, pool, burn_manager, cetus_config, cetus_pool, rewarder_vault, clock)` (+`_inverted`) — collects Cetus rewarder incentives for the position, split like quote LP fees. Only relevant when Cetus adds incentives to the pair.
 - `pool::unlock_tranche_time(pool, index, clock)` — releases a matured time tranche to the creator.
 - `migration::unlock_tranche_tvl{,_inverted}(pool, cetus_pool, currency, index)` — private `entry`: call as a direct PTB command (its output can't be composed, by design). Condition: pool MIGRATED and market cap (Currency circulating supply × Cetus price) ≥ the tranche target. Event `TvlTrancheUnlockedEvent` records supply, sqrt price and computed market cap.
-- `pool::unlock_tranche_halted(pool, index)` — only in the terminal HALTED phase (post emergency withdraw): releases any remaining tranche to the creator.
 
 ## Admin operations (require the key-only AdminCap)
 
@@ -49,11 +48,9 @@ There is no griefing vector: only coins that actually have a `RegulatedCoinMetad
 - `set_treasury`, `set_paused` (pause blocks only create+buy; sells/unlocks/migrate/claims never pause).
 - `transfer_admin(cap, to)` — the only way to move the AdminCap.
 - After a package upgrade: `bump_config_version`, and `bump_pool_version` per live pool.
-- `pool::emergency_withdraw(cap, cfg, pool, clock)` — backstop for a pool stuck COMPLETED ≥ 7 days (grace from `completed_at_ms`); drains to treasury and sets HALTED. With Keeper 1 running this should never fire; treat any firing as an incident (it means Cetus-side config broke migration — investigate before withdrawing).
 
 ## Watch list (alerting)
 
-- `CurveCompletedEvent` with no matching `MigratedEvent` within ~1 minute → Keeper 1 failure.
-- `EmergencyWithdrawEvent` → incident.
+- `CurveCompletedEvent` with no matching `MigratedEvent` within ~1 minute → Keeper 1 failure. A pool that stays COMPLETED means migration is aborting — investigate Cetus-side state (fee tier, coin allow-list, package version) immediately; there is no admin backstop.
 - `PoolCreatedEvent` whose base has a `RegulatedCoinMetadata` object → Keeper 2 missed a coin; hide the pool in the frontend.
 - Cetus `GlobalConfig.package_version` bumps → rebuild/relink against the new Cetus package before it breaks `migrate`/claims.

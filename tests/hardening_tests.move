@@ -431,9 +431,7 @@ module bondingcurvesui::hardening_tests {
         scenario.end();
     }
 
-    // === Emergency backstop ===
-
-    const GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+    // === Helper: completed pool (used by view tests) ===
 
     /// Completes the ZZZ curve with a TVL tranche so the halted-unlock path
     /// can be exercised.
@@ -468,87 +466,6 @@ module bondingcurvesui::hardening_tests {
         };
     }
 
-    #[test, expected_failure(abort_code = pool::EGracePeriodActive)]
-    fun emergency_withdraw_blocked_during_grace_period() {
-        let (mut scenario, mut clock) = setup();
-        clock.set_for_testing(1_000_000);
-        complete_with_tvl_tranche(&mut scenario, &clock);
-        clock.set_for_testing(1_000_000 + GRACE_MS - 1);
-        scenario.next_tx(ADMIN);
-        {
-            let admin_cap = scenario.take_from_sender<AdminCap>();
-            let cfg = scenario.take_shared<LaunchpadConfig>();
-            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock);
-            scenario.return_to_sender(admin_cap);
-            ts::return_shared(cfg);
-            ts::return_shared(pool);
-        };
-        clock.destroy_for_testing();
-        scenario.end();
-    }
-
-    #[test]
-    fun emergency_withdraw_after_grace_halts_pool_and_frees_tranches() {
-        let (mut scenario, mut clock) = setup();
-        clock.set_for_testing(1_000_000);
-        complete_with_tvl_tranche(&mut scenario, &clock);
-        clock.set_for_testing(1_000_000 + GRACE_MS);
-        scenario.next_tx(ADMIN);
-        {
-            let admin_cap = scenario.take_from_sender<AdminCap>();
-            let cfg = scenario.take_shared<LaunchpadConfig>();
-            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock);
-            assert!(pool.phase() == pool::phase_halted());
-            let (base, lp_base, quote) = pool.real_reserves();
-            assert!(base == 0 && lp_base == 0 && quote == 0);
-            scenario.return_to_sender(admin_cap);
-            ts::return_shared(cfg);
-            ts::return_shared(pool);
-            // Funds go to the treasury's address balance; assert amounts via
-            // the event (>= threshold raised).
-            let events = sui::event::events_by_type<
-                pool::EmergencyWithdrawEvent<ZZZ_BASE, MOCK_QUOTE>,
-            >();
-            assert!(events.length() == 1);
-            let (_base_out, quote_out) =
-                pool::emergency_withdraw_event_amounts(&events[0]);
-            assert!(quote_out >= 3_000_000_000);
-        };
-        // The TVL tranche is now claimable (permissionless), to the creator.
-        scenario.next_tx(@0xFEED);
-        {
-            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_halted(&mut pool, 0);
-            let (_, _, _, locked, claimed) = pool.tranche_info(0);
-            assert!(locked == 0 && claimed);
-            ts::return_shared(pool);
-            let unlocks = sui::event::events_by_type<
-                pool::TrancheUnlockedEvent<ZZZ_BASE, MOCK_QUOTE>,
-            >();
-            assert!(unlocks.length() == 1);
-            let (amount, recipient) = pool::tranche_unlocked_event_amount(&unlocks[0]);
-            assert!(amount > 0 && recipient == CREATOR);
-        };
-        clock.destroy_for_testing();
-        scenario.end();
-    }
-
-    #[test, expected_failure(abort_code = pool::ENotHalted)]
-    fun halted_unlock_requires_halted_phase() {
-        let (mut scenario, mut clock) = setup();
-        clock.set_for_testing(1_000_000);
-        complete_with_tvl_tranche(&mut scenario, &clock);
-        scenario.next_tx(CREATOR);
-        {
-            let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_halted(&mut pool, 0);
-            ts::return_shared(pool);
-        };
-        clock.destroy_for_testing();
-        scenario.end();
-    }
 
     // === AdminCap transfer ===
 
