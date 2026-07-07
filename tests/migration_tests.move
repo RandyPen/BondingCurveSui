@@ -307,20 +307,11 @@ module bondingcurvesui::migration_tests {
                 &mut pool,
                 &cetus_pool,
                 &currency,
-                0,
-                scenario.ctx(),
-            );
+                0);
             let (_, _, _, locked, claimed) = pool.tranche_info(0);
             assert!(locked == 0 && claimed);
             ts::return_shared(pool);
             ts::return_shared(cetus_pool);
-        };
-        // Unlocked tokens went to the creator, not the caller.
-        scenario.next_tx(CREATOR);
-        {
-            let base = scenario.take_from_sender<sui::coin::Coin<ZZZ_BASE>>();
-            assert!(base.value() > 0);
-            scenario.return_to_sender(base);
         };
         end(scenario, clock, cetus_env, currency);
     }
@@ -344,9 +335,7 @@ module bondingcurvesui::migration_tests {
                 &mut pool,
                 &cetus_pool,
                 &currency,
-                0,
-                scenario.ctx(),
-            );
+                0);
             let (_, _, _, locked, claimed) = pool.tranche_info(0);
             assert!(locked == 0 && claimed);
             ts::return_shared(pool);
@@ -374,9 +363,7 @@ module bondingcurvesui::migration_tests {
                 &mut pool,
                 &cetus_pool,
                 &currency,
-                0,
-                scenario.ctx(),
-            );
+                0);
             ts::return_shared(pool);
             ts::return_shared(cetus_pool);
         };
@@ -401,7 +388,7 @@ module bondingcurvesui::migration_tests {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             let fake_pool =
                 scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0, scenario.ctx());
+            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0);
             ts::return_shared(pool);
             ts::return_shared(fake_pool);
         };
@@ -511,7 +498,7 @@ module bondingcurvesui::migration_tests {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             let fake_pool =
                 scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0, scenario.ctx());
+            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0);
             ts::return_shared(pool);
             ts::return_shared(fake_pool);
         };

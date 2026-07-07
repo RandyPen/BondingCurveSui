@@ -56,7 +56,7 @@ tx.transferObjects([baseOut, change], sender);
 await client.signAndExecuteTransaction({ transaction: tx, signer, options: { showEvents: true } });
 ```
 
-(`buy_entry`/`sell_entry` exist for CLI use; from the SDK prefer the public functions above — you keep the returned coins as PTB values.)
+(`buy_entry`/`sell_entry` exist for CLI use and credit outputs to the sender's **address balance** via `balance::send_funds` rather than creating Coin objects; from the SDK prefer the public functions above — you keep the returned coins as PTB values.)
 
 ## Sell
 

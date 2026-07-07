@@ -189,7 +189,7 @@ module bondingcurvesui::migration {
         });
 
         // Flush curve fees now that the pool has reached its terminal phase.
-        pool::distribute_curve_fees(cfg, pool, ctx);
+        pool::distribute_curve_fees(cfg, pool);
         position
     }
 
@@ -272,10 +272,10 @@ module bondingcurvesui::migration {
                 / (config::bps_denominator() as u128)) as u64;
         let quote_creator = quote_total - quote_platform;
         if (quote_platform > 0) {
-            transfer::public_transfer(quote_fee.split(quote_platform, ctx), cfg.treasury());
+            pool::send_funds(quote_fee.split(quote_platform, ctx), cfg.treasury());
         };
         if (quote_creator > 0) {
-            transfer::public_transfer(quote_fee.split(quote_creator, ctx), pool.creator());
+            pool::send_funds(quote_fee.split(quote_creator, ctx), pool.creator());
         };
         quote_fee.destroy_zero();
 
@@ -302,9 +302,8 @@ module bondingcurvesui::migration {
         cetus_pool: &CetusPool<Base, Quote>,
         currency: &Currency<Base>,
         index: u64,
-        ctx: &mut TxContext,
     ) {
-        do_unlock_tranche_tvl(pool, cetus_pool, currency, index, ctx)
+        do_unlock_tranche_tvl(pool, cetus_pool, currency, index)
     }
 
     public(package) fun do_unlock_tranche_tvl<Base, Quote>(
@@ -312,7 +311,6 @@ module bondingcurvesui::migration {
         cetus_pool: &CetusPool<Base, Quote>,
         currency: &Currency<Base>,
         index: u64,
-        ctx: &mut TxContext,
     ) {
         unlock_tranche_tvl_internal(
             pool,
@@ -321,7 +319,6 @@ module bondingcurvesui::migration {
             clmm_pool::current_sqrt_price(cetus_pool),
             true,
             index,
-            ctx,
         );
     }
 
@@ -331,9 +328,8 @@ module bondingcurvesui::migration {
         cetus_pool: &CetusPool<Quote, Base>,
         currency: &Currency<Base>,
         index: u64,
-        ctx: &mut TxContext,
     ) {
-        do_unlock_tranche_tvl_inverted(pool, cetus_pool, currency, index, ctx)
+        do_unlock_tranche_tvl_inverted(pool, cetus_pool, currency, index)
     }
 
     public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
@@ -341,7 +337,6 @@ module bondingcurvesui::migration {
         cetus_pool: &CetusPool<Quote, Base>,
         currency: &Currency<Base>,
         index: u64,
-        ctx: &mut TxContext,
     ) {
         unlock_tranche_tvl_internal(
             pool,
@@ -350,7 +345,6 @@ module bondingcurvesui::migration {
             clmm_pool::current_sqrt_price(cetus_pool),
             false,
             index,
-            ctx,
         );
     }
 
@@ -361,7 +355,6 @@ module bondingcurvesui::migration {
         sqrt_price_x64: u128,
         base_is_coin_a: bool,
         index: u64,
-        ctx: &mut TxContext,
     ) {
         pool.assert_pool_version();
         pool.assert_migrated();
@@ -388,7 +381,7 @@ module bondingcurvesui::migration {
             sqrt_price_x64,
             total_supply,
         });
-        transfer::public_transfer(unlocked.into_coin(ctx), creator);
+        sui::balance::send_funds(unlocked, creator);
     }
 
     // === Post-migration LP rewards (Cetus incentives) ===
@@ -455,10 +448,10 @@ module bondingcurvesui::migration {
                 / (config::bps_denominator() as u128)) as u64;
         let creator_amount = total - platform_amount;
         if (platform_amount > 0) {
-            transfer::public_transfer(reward.split(platform_amount, ctx), cfg.treasury());
+            pool::send_funds(reward.split(platform_amount, ctx), cfg.treasury());
         };
         if (creator_amount > 0) {
-            transfer::public_transfer(reward.split(creator_amount, ctx), pool.creator());
+            pool::send_funds(reward.split(creator_amount, ctx), pool.creator());
         };
         reward.destroy_zero();
         event::emit(LpRewardsClaimedEvent<Base, Quote> {

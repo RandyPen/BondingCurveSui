@@ -7,6 +7,8 @@ description: Operate the BondingCurveSui platform — the two mandatory keepers 
 
 IDs from `deployments.json`. Everything here except the Admin section is **permissionless** — any funded address can run it; payouts always go to the hardcoded recipients (treasury / creator), never the caller.
 
+**Payout mechanism**: all payouts are credited to the recipient's **address balance** (`balance::send_funds`, funds accumulator) — no Coin objects are created. The treasury/creator spends them via an address-balance-aware wallet or a PTB `Withdrawal` reservation + `balance::redeem_funds`. Keeper receipts therefore do not show up in `getOwnedObjects`; check address balances instead.
+
 ## Keeper 1 — migrate on completion (MANDATORY)
 
 Subscribe to `<PKG>::pool::CurveCompletedEvent` (module filter on `pool` also works) and immediately call:
@@ -41,7 +43,7 @@ There is no griefing vector: only coins that actually have a `RegulatedCoinMetad
 
 ## Admin operations (require the key-only AdminCap)
 
-- Quote whitelist: `config::add_quote<Q>(cap, cfg, decimals, default_threshold, min_threshold, creation_fee, min_buy_amount, min_tvl_target)`, `update_quote<Q>`, `set_quote_enabled<Q>`. Precondition for every quote: Cetus's pool manager must have run `factory::add_allowed_pair_config<Q>(.., tick_spacing, ..)` — otherwise every launch with that quote aborts.
+- Quote whitelist: `config::add_quote<Q>(cap, cfg, decimals, default_threshold, min_threshold, creation_fee, min_buy_amount, min_tvl_target)`, `update_quote<Q>`, `set_quote_enabled<Q>`. Precondition for every quote: Cetus's pool manager must have run `factory::add_allowed_pair_config<Q>(.., tick_spacing, ..)` — otherwise every launch with that quote aborts. SUI and USDC are confirmed allowed at tick_spacing 200 (Cetus team, 2026-07-07).
 - Fees: `set_fee_params(curve_fee_bps ≤ 1000, curve_fee_platform_bps, lp_fee_platform_bps)` — live pools keep their launch-time snapshot.
 - Launch params: `set_launch_params(base_decimals, initial_virtual_base, remain_base, tick_spacing, min_lock_duration_ms)` — guarded by `initial/remain ≤ 1000`; affects only future launches.
 - `set_treasury`, `set_paused` (pause blocks only create+buy; sells/unlocks/migrate/claims never pause).

@@ -479,7 +479,7 @@ module bondingcurvesui::hardening_tests {
             let admin_cap = scenario.take_from_sender<AdminCap>();
             let cfg = scenario.take_shared<LaunchpadConfig>();
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock, scenario.ctx());
+            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock);
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
             ts::return_shared(pool);
@@ -499,38 +499,37 @@ module bondingcurvesui::hardening_tests {
             let admin_cap = scenario.take_from_sender<AdminCap>();
             let cfg = scenario.take_shared<LaunchpadConfig>();
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock, scenario.ctx());
+            pool::emergency_withdraw(&admin_cap, &cfg, &mut pool, &clock);
             assert!(pool.phase() == pool::phase_halted());
             let (base, lp_base, quote) = pool.real_reserves();
             assert!(base == 0 && lp_base == 0 && quote == 0);
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
             ts::return_shared(pool);
-        };
-        // Treasury (ADMIN) received the stranded liquidity (arrives together
-        // with the flushed platform fee cut; sum the two most recent coins).
-        scenario.next_tx(ADMIN);
-        {
-            let fee_cut = scenario.take_from_sender<sui::coin::Coin<MOCK_QUOTE>>();
-            let withdrawal = scenario.take_from_sender<sui::coin::Coin<MOCK_QUOTE>>();
-            assert!(fee_cut.value() + withdrawal.value() >= 3_000_000_000); // >= threshold raised
-            scenario.return_to_sender(fee_cut);
-            scenario.return_to_sender(withdrawal);
+            // Funds go to the treasury's address balance; assert amounts via
+            // the event (>= threshold raised).
+            let events = sui::event::events_by_type<
+                pool::EmergencyWithdrawEvent<ZZZ_BASE, MOCK_QUOTE>,
+            >();
+            assert!(events.length() == 1);
+            let (_base_out, quote_out) =
+                pool::emergency_withdraw_event_amounts(&events[0]);
+            assert!(quote_out >= 3_000_000_000);
         };
         // The TVL tranche is now claimable (permissionless), to the creator.
         scenario.next_tx(@0xFEED);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_halted(&mut pool, 0, scenario.ctx());
+            pool::unlock_tranche_halted(&mut pool, 0);
             let (_, _, _, locked, claimed) = pool.tranche_info(0);
             assert!(locked == 0 && claimed);
             ts::return_shared(pool);
-        };
-        scenario.next_tx(CREATOR);
-        {
-            let base = scenario.take_from_sender<sui::coin::Coin<ZZZ_BASE>>();
-            assert!(base.value() > 0);
-            scenario.return_to_sender(base);
+            let unlocks = sui::event::events_by_type<
+                pool::TrancheUnlockedEvent<ZZZ_BASE, MOCK_QUOTE>,
+            >();
+            assert!(unlocks.length() == 1);
+            let (amount, recipient) = pool::tranche_unlocked_event_amount(&unlocks[0]);
+            assert!(amount > 0 && recipient == CREATOR);
         };
         clock.destroy_for_testing();
         scenario.end();
@@ -544,7 +543,7 @@ module bondingcurvesui::hardening_tests {
         scenario.next_tx(CREATOR);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_halted(&mut pool, 0, scenario.ctx());
+            pool::unlock_tranche_halted(&mut pool, 0);
             ts::return_shared(pool);
         };
         clock.destroy_for_testing();

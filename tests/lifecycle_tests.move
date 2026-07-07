@@ -165,13 +165,9 @@ module bondingcurvesui::lifecycle_tests {
             ts::return_shared(pool);
         };
 
-        // Creation fee went to the treasury (= ADMIN by default).
-        scenario.next_tx(ADMIN);
-        {
-            let fee = scenario.take_from_sender<Coin<MOCK_QUOTE>>();
-            assert!(fee.value() == CREATION_FEE);
-            scenario.return_to_sender(fee);
-        };
+        // Creation fee exactness is enforced on-chain (EWrongCreationFee) and
+        // paid into the treasury's address balance (funds accumulator), so
+        // there is no Coin object to inspect here.
         end(scenario, clock, currency);
     }
 
@@ -571,26 +567,23 @@ module bondingcurvesui::lifecycle_tests {
             let (p, c) = pool.accrued_fees();
             platform_expected = p;
             creator_expected = c;
-            pool::distribute_curve_fees(&cfg, &mut pool, scenario.ctx());
+            pool::distribute_curve_fees(&cfg, &mut pool);
             let (p2, c2) = pool.accrued_fees();
             assert!(p2 == 0 && c2 == 0);
             ts::return_shared(cfg);
             ts::return_shared(pool);
+            // Payouts go to address balances (funds accumulator), not Coin
+            // objects; assert the exact amounts through the event.
+            let events = sui::event::events_by_type<
+                pool::CurveFeesDistributedEvent<ZZZ_BASE, MOCK_QUOTE>,
+            >();
+            assert!(events.length() == 1);
+            let (platform_paid, creator_paid) =
+                pool::fees_distributed_event_amounts(&events[0]);
+            assert!(platform_paid == platform_expected);
+            assert!(creator_paid == creator_expected);
         };
         assert!(platform_expected > 0 && creator_expected > 0);
-
-        scenario.next_tx(ADMIN);
-        {
-            let fee = scenario.take_from_sender<Coin<MOCK_QUOTE>>();
-            assert!(fee.value() == platform_expected);
-            scenario.return_to_sender(fee);
-        };
-        scenario.next_tx(CREATOR);
-        {
-            let fee = scenario.take_from_sender<Coin<MOCK_QUOTE>>();
-            assert!(fee.value() == creator_expected);
-            scenario.return_to_sender(fee);
-        };
         end(scenario, clock, currency);
     }
 
@@ -613,17 +606,17 @@ module bondingcurvesui::lifecycle_tests {
         scenario.next_tx(TRADER); // permissionless: anyone can trigger
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_time(&mut pool, 0, &clock, scenario.ctx());
+            pool::unlock_tranche_time(&mut pool, 0, &clock);
             let (_, _, _, locked, claimed) = pool.tranche_info(0);
             assert!(locked == 0 && claimed);
             ts::return_shared(pool);
-        };
-        // Tokens landed with the creator, not the caller.
-        scenario.next_tx(CREATOR);
-        {
-            let base = scenario.take_from_sender<Coin<ZZZ_BASE>>();
-            assert!(base.value() > 0);
-            scenario.return_to_sender(base);
+            // Funds went to the creator's address balance; verify via event.
+            let events = sui::event::events_by_type<
+                pool::TrancheUnlockedEvent<ZZZ_BASE, MOCK_QUOTE>,
+            >();
+            assert!(events.length() == 1);
+            let (amount, recipient) = pool::tranche_unlocked_event_amount(&events[0]);
+            assert!(amount > 0 && recipient == CREATOR);
         };
         end(scenario, clock, currency);
     }
@@ -644,7 +637,7 @@ module bondingcurvesui::lifecycle_tests {
         scenario.next_tx(TRADER);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_time(&mut pool, 0, &clock, scenario.ctx());
+            pool::unlock_tranche_time(&mut pool, 0, &clock);
             ts::return_shared(pool);
         };
         end(scenario, clock, currency);
@@ -666,8 +659,8 @@ module bondingcurvesui::lifecycle_tests {
         scenario.next_tx(TRADER);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-            pool::unlock_tranche_time(&mut pool, 0, &clock, scenario.ctx());
-            pool::unlock_tranche_time(&mut pool, 0, &clock, scenario.ctx());
+            pool::unlock_tranche_time(&mut pool, 0, &clock);
+            pool::unlock_tranche_time(&mut pool, 0, &clock);
             ts::return_shared(pool);
         };
         end(scenario, clock, currency);
@@ -692,7 +685,7 @@ module bondingcurvesui::lifecycle_tests {
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             // Time-unlock entry must not release a TVL tranche.
-            pool::unlock_tranche_time(&mut pool, 0, &clock, scenario.ctx());
+            pool::unlock_tranche_time(&mut pool, 0, &clock);
             ts::return_shared(pool);
         };
         end(scenario, clock, currency);

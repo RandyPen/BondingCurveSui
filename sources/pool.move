@@ -253,7 +253,7 @@ module bondingcurvesui::pool {
 
         // Creation fee must match exactly; split it off `payment` client-side.
         assert!(creation_fee.value() == quote_params.quote_creation_fee(), EWrongCreationFee);
-        pay_or_destroy(creation_fee, cfg.treasury());
+        send_funds(creation_fee, cfg.treasury());
 
         // Base coin sanity: fresh supply, expected decimals, and a metadata
         // cap that nobody claimed before us.
@@ -392,7 +392,7 @@ module bondingcurvesui::pool {
             clock,
             ctx,
         );
-        pay_or_destroy(change, ctx.sender());
+        send_funds(change, ctx.sender());
     }
 
     fun execute_tranche_buys<Base, Quote>(
@@ -525,8 +525,8 @@ module bondingcurvesui::pool {
         ctx: &mut TxContext,
     ) {
         let (base_out, change) = buy(cfg, pool, quote_in, min_base_out, clock, ctx);
-        transfer::public_transfer(base_out, ctx.sender());
-        pay_or_destroy(change, ctx.sender());
+        send_funds(base_out, ctx.sender());
+        send_funds(change, ctx.sender());
     }
 
     entry fun sell_entry<Base, Quote>(
@@ -537,7 +537,7 @@ module bondingcurvesui::pool {
         ctx: &mut TxContext,
     ) {
         let quote_out = sell(cfg, pool, base_in, min_quote_out, ctx);
-        transfer::public_transfer(quote_out, ctx.sender());
+        send_funds(quote_out, ctx.sender());
     }
 
     /// Curve buy over a gross quote balance. Returns `(base_out, change)`;
@@ -616,23 +616,16 @@ module bondingcurvesui::pool {
     public fun distribute_curve_fees<Base, Quote>(
         cfg: &LaunchpadConfig,
         pool: &mut Pool<Base, Quote>,
-        ctx: &mut TxContext,
     ) {
         cfg.assert_version();
         pool.assert_pool_version();
         let platform_amount = pool.platform_fees.value();
         let creator_amount = pool.creator_fees.value();
         if (platform_amount > 0) {
-            transfer::public_transfer(
-                pool.platform_fees.withdraw_all().into_coin(ctx),
-                cfg.treasury(),
-            );
+            balance::send_funds(pool.platform_fees.withdraw_all(), cfg.treasury());
         };
         if (creator_amount > 0) {
-            transfer::public_transfer(
-                pool.creator_fees.withdraw_all().into_coin(ctx),
-                pool.creator,
-            );
+            balance::send_funds(pool.creator_fees.withdraw_all(), pool.creator);
         };
         if (platform_amount > 0 || creator_amount > 0) {
             event::emit(CurveFeesDistributedEvent<Base, Quote> {
@@ -651,7 +644,6 @@ module bondingcurvesui::pool {
         pool: &mut Pool<Base, Quote>,
         index: u64,
         clock: &Clock,
-        ctx: &mut TxContext,
     ) {
         pool.assert_pool_version();
         let now = clock.timestamp_ms();
@@ -667,7 +659,7 @@ module bondingcurvesui::pool {
             amount: unlocked.value(),
             creator,
         });
-        transfer::public_transfer(unlocked.into_coin(ctx), creator);
+        balance::send_funds(unlocked, creator);
     }
 
     // === Emergency backstop ===
@@ -688,7 +680,6 @@ module bondingcurvesui::pool {
         cfg: &LaunchpadConfig,
         pool: &mut Pool<Base, Quote>,
         clock: &Clock,
-        ctx: &mut TxContext,
     ) {
         cfg.assert_version();
         let (base, quote) = withdraw_for_migration(pool); // asserts COMPLETED
@@ -702,9 +693,9 @@ module bondingcurvesui::pool {
             base_amount: base.value(),
             quote_amount: quote.value(),
         });
-        transfer::public_transfer(base.into_coin(ctx), cfg.treasury());
-        transfer::public_transfer(quote.into_coin(ctx), cfg.treasury());
-        distribute_curve_fees(cfg, pool, ctx);
+        balance::send_funds(base, cfg.treasury());
+        balance::send_funds(quote, cfg.treasury());
+        distribute_curve_fees(cfg, pool);
     }
 
     /// In the terminal HALTED phase the pool will never migrate, so TVL
@@ -713,7 +704,6 @@ module bondingcurvesui::pool {
     public fun unlock_tranche_halted<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         index: u64,
-        ctx: &mut TxContext,
     ) {
         pool.assert_pool_version();
         assert!(pool.phase == PHASE_HALTED, ENotHalted);
@@ -727,7 +717,7 @@ module bondingcurvesui::pool {
             amount: unlocked.value(),
             creator,
         });
-        transfer::public_transfer(unlocked.into_coin(ctx), creator);
+        balance::send_funds(unlocked, creator);
     }
 
     // === Views ===
@@ -952,9 +942,12 @@ module bondingcurvesui::pool {
         tranche.locked.withdraw_all()
     }
 
-    fun pay_or_destroy<T>(coin: Coin<T>, to: address) {
+    /// Single outbound-payment choke point: non-zero value is credited to
+    /// the recipient's address balance (funds accumulator) instead of
+    /// creating a Coin object; zero coins are destroyed.
+    public(package) fun send_funds<T>(coin: Coin<T>, recipient: address) {
         if (coin.value() > 0) {
-            transfer::public_transfer(coin, to);
+            balance::send_funds(coin.into_balance(), recipient);
         } else {
             coin.destroy_zero();
         }
@@ -967,5 +960,26 @@ module bondingcurvesui::pool {
         ev: &TrancheLockedEvent<Base, Quote>,
     ): (u64, u64) {
         (ev.quote_in, ev.base_locked)
+    }
+
+    #[test_only]
+    public fun fees_distributed_event_amounts<Base, Quote>(
+        ev: &CurveFeesDistributedEvent<Base, Quote>,
+    ): (u64, u64) {
+        (ev.platform_amount, ev.creator_amount)
+    }
+
+    #[test_only]
+    public fun tranche_unlocked_event_amount<Base, Quote>(
+        ev: &TrancheUnlockedEvent<Base, Quote>,
+    ): (u64, address) {
+        (ev.amount, ev.creator)
+    }
+
+    #[test_only]
+    public fun emergency_withdraw_event_amounts<Base, Quote>(
+        ev: &EmergencyWithdrawEvent<Base, Quote>,
+    ): (u64, u64) {
+        (ev.base_amount, ev.quote_amount)
     }
 }

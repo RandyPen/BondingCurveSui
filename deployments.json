@@ -8,7 +8,17 @@
     "cetusPools": "",
     "lpBurnManager": "",
     "cetusRewarderVault": "",
-    "quotes": {}
+    "quotes": {
+      "_comment": "Cetus allowed_pair_config confirmed for SUI and USDC at tick_spacing 200 (1% fee tier).",
+      "SUI": {
+        "type": "0x2::sui::SUI",
+        "cetusAllowedTickSpacing": 200
+      },
+      "USDC": {
+        "type": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
+        "cetusAllowedTickSpacing": 200
+      }
+    }
   },
   "testnet": {
     "launchpadPackage": "",
