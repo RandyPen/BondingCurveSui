@@ -1,0 +1,18 @@
+# Vendored interface stub of Cetus lp_burn (mainnet package).
+# Trimmed to the entry points this project links against; bodies abort like the
+# official cetus-clmm-interface stubs. Vendored locally to avoid the interface
+# repo's transitive clmm_vester dependency, whose MVR resolution fails offline.
+# published-at is the latest mainnet package (v7), from
+# `mvr resolve @cetuspackages/lpburn --network mainnet` on 2026-07-07;
+# re-check via MVR before publishing.
+[package]
+name = "LpBurn"
+version = "0.0.1"
+edition = "2024"
+published-at = "0xa5d8457e049c8f2a04b7b47e925b200f457e57016aa158f050a931c8ead99fe0"
+
+[dependencies]
+CetusClmm = { git = "https://github.com/CetusProtocol/cetus-contracts.git", subdir = "packages/cetus_clmm", rev = "clmm-v14", override = true }
+
+[addresses]
+lp_burn = "0x12d73de9a6bc3cb658ec9dc0fe7de2662be1cea5c76c092fcc3606048cdbac27"

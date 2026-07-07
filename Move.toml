@@ -1,0 +1,26 @@
+[package]
+name = "bondingcurvesui"
+edition = "2024"
+
+# Dependency strategy
+# -------------------
+# The pins below are EXACTLY what Move Registry resolves for the official
+# packages on mainnet (verified via `mvr resolve` on 2026-07-07):
+#   @cetuspackages/clmm   -> cetus-contracts.git, packages/cetus_clmm, tag clmm-v14
+#                            published-at (v14): 0x25ebb9a7c50eb17b3fa9c5a30fb8b5ad8f97caaf4928943acbcff7153dfee5e3
+#   @cetuspackages/lpburn -> cetus-clmm-interface.git, sui/lp_burn, tag mainnet-v1.52.3
+#                            published-at (v7):  0xa5d8457e049c8f2a04b7b47e925b200f457e57016aa158f050a931c8ead99fe0
+# We use git pins instead of `r.mvr` deps because MVR resolution follows the
+# active `sui client` environment, and Cetus's MVR metadata is broken on
+# testnet (clmm has no git_info; lpburn has no testnet mapping at all), which
+# makes `r.mvr` builds fail outside mainnet. lp_burn is vendored (see
+# vendor/lp_burn) to drop its clmm_vester transitive dep, which pulls
+# `r.mvr = "@cetuspackages/clmm"` and reintroduces the same failure.
+# Before a MAINNET publish, re-run `mvr resolve` to refresh published-at
+# addresses (see the deployment checklist).
+[dependencies]
+CetusClmm = { git = "https://github.com/CetusProtocol/cetus-contracts.git", subdir = "packages/cetus_clmm", rev = "clmm-v14", override = true }
+LpBurn = { local = "./vendor/lp_burn" }
+
+[addresses]
+bondingcurvesui = "0x0"

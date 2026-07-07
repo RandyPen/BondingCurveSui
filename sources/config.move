@@ -1,0 +1,378 @@
+/// Global launchpad configuration: admin capability, quote-coin whitelist,
+/// fee parameters, launch constants, and the base-coin registry that
+/// guarantees one launch per base coin type.
+module bondingcurvesui::config {
+    use std::type_name::{Self, TypeName};
+    use sui::event;
+    use sui::table::{Self, Table};
+
+    // === Errors ===
+
+    /// Package version is older than the config's required version.
+    const EVersionMismatch: u64 = 1;
+    /// Operation is blocked while the launchpad is paused.
+    const EPaused: u64 = 2;
+    /// Quote coin type is already whitelisted.
+    const EQuoteAlreadyListed: u64 = 3;
+    /// Quote coin type is not whitelisted or is disabled.
+    const EQuoteNotListed: u64 = 4;
+    /// Fee bps parameter exceeds its allowed maximum.
+    const EFeeTooHigh: u64 = 5;
+    /// initial_virtual_base must be strictly greater than remain_base (> 0).
+    const EInvalidLaunchParams: u64 = 6;
+    /// A pool for this base coin type already exists.
+    const EBaseAlreadyLaunched: u64 = 7;
+    /// Threshold below the per-quote minimum.
+    const EThresholdTooLow: u64 = 8;
+
+    // === Constants ===
+
+    const VERSION: u64 = 1;
+    const BPS_DENOMINATOR: u64 = 10_000;
+    /// Hard cap on the curve trading fee: 10%.
+    const MAX_CURVE_FEE_BPS: u64 = 1_000;
+
+    // === Structs ===
+
+    /// Admin capability. `key`-only on purpose: it cannot be wrapped, stored
+    /// in other objects, or moved with `transfer::public_transfer`; the only
+    /// way to hand it over is `transfer_admin` below.
+    public struct AdminCap has key {
+        id: UID,
+    }
+
+    /// Per-quote-coin whitelist parameters. Amounts are in the quote coin's
+    /// base units.
+    public struct QuoteParams has store, copy, drop {
+        /// Disabled quotes reject new launches; existing pools are unaffected.
+        enabled: bool,
+        decimals: u8,
+        /// Quote amount the curve must raise before graduation (default).
+        default_threshold: u64,
+        /// Floor for a creator-chosen threshold.
+        min_threshold: u64,
+        /// Flat launch fee paid in this quote coin.
+        creation_fee: u64,
+        /// Minimum gross quote input per buy (dust guard).
+        min_buy_amount: u64,
+    }
+
+    public struct LaunchpadConfig has key {
+        id: UID,
+        version: u64,
+        paused: bool,
+        /// Platform fee recipient.
+        treasury: address,
+        // Launch parameters shared by every base coin.
+        base_decimals: u8,
+        /// Real tokens minted into the curve (sellable side), base units.
+        initial_virtual_base: u64,
+        /// Real tokens reserved for the CLMM liquidity at migration.
+        remain_base: u64,
+        // Fee parameters (bps of BPS_DENOMINATOR).
+        /// Trading fee charged on curve buys/sells, in quote.
+        curve_fee_bps: u64,
+        /// Platform share of the curve fee; remainder accrues to the creator.
+        curve_fee_platform_bps: u64,
+        /// Platform share of post-migration quote-side LP fees; remainder to
+        /// the creator. Base-side LP fees are always burned.
+        lp_fee_platform_bps: u64,
+        /// Cetus fee-tier selector; must be a registered FeeTier on Cetus.
+        tick_spacing: u32,
+        /// Quote-coin whitelist.
+        quotes: Table<TypeName, QuoteParams>,
+        /// Base coin type -> pool object ID; enforces one launch per base.
+        pools: Table<TypeName, ID>,
+    }
+
+    // === Events ===
+
+    public struct QuoteListedEvent has copy, drop {
+        quote: TypeName,
+        params: QuoteParams,
+    }
+
+    public struct QuoteUpdatedEvent has copy, drop {
+        quote: TypeName,
+        params: QuoteParams,
+    }
+
+    public struct FeeParamsUpdatedEvent has copy, drop {
+        curve_fee_bps: u64,
+        curve_fee_platform_bps: u64,
+        lp_fee_platform_bps: u64,
+    }
+
+    public struct LaunchParamsUpdatedEvent has copy, drop {
+        base_decimals: u8,
+        initial_virtual_base: u64,
+        remain_base: u64,
+        tick_spacing: u32,
+    }
+
+    public struct TreasuryUpdatedEvent has copy, drop {
+        treasury: address,
+    }
+
+    public struct PausedEvent has copy, drop {
+        paused: bool,
+    }
+
+    public struct AdminTransferredEvent has copy, drop {
+        from: address,
+        to: address,
+    }
+
+    // === Init ===
+
+    fun init(ctx: &mut TxContext) {
+        transfer::transfer(AdminCap { id: object::new(ctx) }, ctx.sender());
+        transfer::share_object(LaunchpadConfig {
+            id: object::new(ctx),
+            version: VERSION,
+            paused: false,
+            treasury: ctx.sender(),
+            base_decimals: 6,
+            initial_virtual_base: 8_000_000_000_000, // 8M with 6 decimals
+            remain_base: 2_000_000_000_000, // 2M with 6 decimals
+            curve_fee_bps: 100, // 1%
+            curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
+            lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
+            tick_spacing: 200, // Cetus 1% fee tier
+            quotes: table::new(ctx),
+            pools: table::new(ctx),
+        });
+    }
+
+    // === Admin functions ===
+
+    /// The only way to move the AdminCap (it has no `store`).
+    public fun transfer_admin(cap: AdminCap, to: address, ctx: &TxContext) {
+        event::emit(AdminTransferredEvent { from: ctx.sender(), to });
+        transfer::transfer(cap, to);
+    }
+
+    public fun add_quote<Quote>(
+        _: &AdminCap,
+        cfg: &mut LaunchpadConfig,
+        decimals: u8,
+        default_threshold: u64,
+        min_threshold: u64,
+        creation_fee: u64,
+        min_buy_amount: u64,
+    ) {
+        cfg.assert_version();
+        let quote = type_name::with_defining_ids<Quote>();
+        assert!(!cfg.quotes.contains(quote), EQuoteAlreadyListed);
+        let params = new_quote_params(
+            decimals, default_threshold, min_threshold, creation_fee, min_buy_amount,
+        );
+        cfg.quotes.add(quote, params);
+        event::emit(QuoteListedEvent { quote, params });
+    }
+
+    public fun update_quote<Quote>(
+        _: &AdminCap,
+        cfg: &mut LaunchpadConfig,
+        decimals: u8,
+        default_threshold: u64,
+        min_threshold: u64,
+        creation_fee: u64,
+        min_buy_amount: u64,
+    ) {
+        cfg.assert_version();
+        let quote = type_name::with_defining_ids<Quote>();
+        assert!(cfg.quotes.contains(quote), EQuoteNotListed);
+        let enabled = cfg.quotes[quote].enabled;
+        let mut params = new_quote_params(
+            decimals, default_threshold, min_threshold, creation_fee, min_buy_amount,
+        );
+        params.enabled = enabled;
+        *&mut cfg.quotes[quote] = params;
+        event::emit(QuoteUpdatedEvent { quote, params });
+    }
+
+    public fun set_quote_enabled<Quote>(
+        _: &AdminCap,
+        cfg: &mut LaunchpadConfig,
+        enabled: bool,
+    ) {
+        cfg.assert_version();
+        let quote = type_name::with_defining_ids<Quote>();
+        assert!(cfg.quotes.contains(quote), EQuoteNotListed);
+        cfg.quotes[quote].enabled = enabled;
+        event::emit(QuoteUpdatedEvent { quote, params: cfg.quotes[quote] });
+    }
+
+    public fun set_fee_params(
+        _: &AdminCap,
+        cfg: &mut LaunchpadConfig,
+        curve_fee_bps: u64,
+        curve_fee_platform_bps: u64,
+        lp_fee_platform_bps: u64,
+    ) {
+        cfg.assert_version();
+        assert!(curve_fee_bps <= MAX_CURVE_FEE_BPS, EFeeTooHigh);
+        assert!(curve_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
+        assert!(lp_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
+        cfg.curve_fee_bps = curve_fee_bps;
+        cfg.curve_fee_platform_bps = curve_fee_platform_bps;
+        cfg.lp_fee_platform_bps = lp_fee_platform_bps;
+        event::emit(FeeParamsUpdatedEvent {
+            curve_fee_bps,
+            curve_fee_platform_bps,
+            lp_fee_platform_bps,
+        });
+    }
+
+    public fun set_launch_params(
+        _: &AdminCap,
+        cfg: &mut LaunchpadConfig,
+        base_decimals: u8,
+        initial_virtual_base: u64,
+        remain_base: u64,
+        tick_spacing: u32,
+    ) {
+        cfg.assert_version();
+        assert!(remain_base > 0 && initial_virtual_base > remain_base, EInvalidLaunchParams);
+        cfg.base_decimals = base_decimals;
+        cfg.initial_virtual_base = initial_virtual_base;
+        cfg.remain_base = remain_base;
+        cfg.tick_spacing = tick_spacing;
+        event::emit(LaunchParamsUpdatedEvent {
+            base_decimals,
+            initial_virtual_base,
+            remain_base,
+            tick_spacing,
+        });
+    }
+
+    public fun set_treasury(_: &AdminCap, cfg: &mut LaunchpadConfig, treasury: address) {
+        cfg.assert_version();
+        cfg.treasury = treasury;
+        event::emit(TreasuryUpdatedEvent { treasury });
+    }
+
+    public fun set_paused(_: &AdminCap, cfg: &mut LaunchpadConfig, paused: bool) {
+        cfg.assert_version();
+        cfg.paused = paused;
+        event::emit(PausedEvent { paused });
+    }
+
+    /// After a package upgrade, raise the config's required version to the
+    /// new package VERSION.
+    public fun bump_config_version(_: &AdminCap, cfg: &mut LaunchpadConfig) {
+        cfg.version = VERSION;
+    }
+
+    // === Package-internal API ===
+
+    /// Registers a launched base coin; aborts if it was launched before.
+    public(package) fun register_pool(cfg: &mut LaunchpadConfig, base: TypeName, pool_id: ID) {
+        assert!(!cfg.pools.contains(base), EBaseAlreadyLaunched);
+        cfg.pools.add(base, pool_id);
+    }
+
+    /// Returns the parameters of an enabled, whitelisted quote coin.
+    public(package) fun enabled_quote_params(cfg: &LaunchpadConfig, quote: TypeName): QuoteParams {
+        assert!(cfg.quotes.contains(quote), EQuoteNotListed);
+        let params = cfg.quotes[quote];
+        assert!(params.enabled, EQuoteNotListed);
+        params
+    }
+
+    /// Resolves and validates the graduation threshold for a launch.
+    public(package) fun resolve_threshold(params: &QuoteParams, requested: Option<u64>): u64 {
+        if (requested.is_some()) {
+            let threshold = requested.destroy_some();
+            assert!(threshold >= params.min_threshold, EThresholdTooLow);
+            threshold
+        } else {
+            params.default_threshold
+        }
+    }
+
+    // === Asserts ===
+
+    public fun assert_version(cfg: &LaunchpadConfig) {
+        assert!(cfg.version <= VERSION, EVersionMismatch);
+    }
+
+    public fun assert_not_paused(cfg: &LaunchpadConfig) {
+        assert!(!cfg.paused, EPaused);
+    }
+
+    // === Views ===
+
+    public fun treasury(cfg: &LaunchpadConfig): address { cfg.treasury }
+
+    public fun base_decimals(cfg: &LaunchpadConfig): u8 { cfg.base_decimals }
+
+    public fun initial_virtual_base(cfg: &LaunchpadConfig): u64 { cfg.initial_virtual_base }
+
+    public fun remain_base(cfg: &LaunchpadConfig): u64 { cfg.remain_base }
+
+    public fun curve_fee_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_bps }
+
+    public fun curve_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_platform_bps }
+
+    public fun lp_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.lp_fee_platform_bps }
+
+    public fun tick_spacing(cfg: &LaunchpadConfig): u32 { cfg.tick_spacing }
+
+    public fun is_paused(cfg: &LaunchpadConfig): bool { cfg.paused }
+
+    public fun is_quote_listed(cfg: &LaunchpadConfig, quote: TypeName): bool {
+        cfg.quotes.contains(quote)
+    }
+
+    public fun pool_id(cfg: &LaunchpadConfig, base: TypeName): Option<ID> {
+        if (cfg.pools.contains(base)) {
+            option::some(cfg.pools[base])
+        } else {
+            option::none()
+        }
+    }
+
+    public fun bps_denominator(): u64 { BPS_DENOMINATOR }
+
+    // QuoteParams field accessors.
+    public fun quote_enabled(params: &QuoteParams): bool { params.enabled }
+
+    public fun quote_decimals(params: &QuoteParams): u8 { params.decimals }
+
+    public fun quote_default_threshold(params: &QuoteParams): u64 { params.default_threshold }
+
+    public fun quote_min_threshold(params: &QuoteParams): u64 { params.min_threshold }
+
+    public fun quote_creation_fee(params: &QuoteParams): u64 { params.creation_fee }
+
+    public fun quote_min_buy_amount(params: &QuoteParams): u64 { params.min_buy_amount }
+
+    // === Internal ===
+
+    fun new_quote_params(
+        decimals: u8,
+        default_threshold: u64,
+        min_threshold: u64,
+        creation_fee: u64,
+        min_buy_amount: u64,
+    ): QuoteParams {
+        assert!(default_threshold >= min_threshold && min_threshold > 0, EThresholdTooLow);
+        QuoteParams {
+            enabled: true,
+            decimals,
+            default_threshold,
+            min_threshold,
+            creation_fee,
+            min_buy_amount,
+        }
+    }
+
+    // === Test helpers ===
+
+    #[test_only]
+    public fun init_for_testing(ctx: &mut TxContext) {
+        init(ctx);
+    }
+}
