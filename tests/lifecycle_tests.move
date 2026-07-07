@@ -22,6 +22,8 @@ module bondingcurvesui::lifecycle_tests {
     const MIN_THRESHOLD: u64 = 1_000_000_000;
     const CREATION_FEE: u64 = 10_000_000;
     const MIN_BUY: u64 = 1_000;
+    const MIN_TVL_TARGET: u64 = 1_000;
+    const MIN_LOCK_MS: u64 = 60 * 60 * 1000; // config default
 
     // === Setup helpers ===
 
@@ -40,6 +42,7 @@ module bondingcurvesui::lifecycle_tests {
                 MIN_THRESHOLD,
                 CREATION_FEE,
                 MIN_BUY,
+                MIN_TVL_TARGET,
             );
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
@@ -182,7 +185,7 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[100_000_000, 200_000_000],
             vector[pool::lock_kind_time(), pool::lock_kind_tvl()],
-            vector[2_000_000, 50_000_000_000],
+            vector[1_000_000 + MIN_LOCK_MS, 50_000_000_000],
             budget,
         );
 
@@ -192,7 +195,7 @@ module bondingcurvesui::lifecycle_tests {
             assert!(pool.tranche_count() == 2);
             let (kind0, ts0, tvl0, locked0, claimed0) = pool.tranche_info(0);
             assert!(kind0 == pool::lock_kind_time());
-            assert!(ts0 == 2_000_000 && tvl0 == 0);
+            assert!(ts0 == 1_000_000 + MIN_LOCK_MS && tvl0 == 0);
             assert!(locked0 > 0 && !claimed0);
             let (kind1, ts1, tvl1, locked1, claimed1) = pool.tranche_info(1);
             assert!(kind1 == pool::lock_kind_tvl());
@@ -326,7 +329,7 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[100_000_000],
             vector[pool::lock_kind_time()],
-            vector[5_000_000], // not strictly in the future
+            vector[5_000_000 + MIN_LOCK_MS - 1], // just below the minimum duration
             100_000_000,
         );
         end(scenario, clock, currency);
@@ -486,9 +489,19 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[4_000_000_000],
             vector[pool::lock_kind_time()],
-            vector[1_000_000],
+            vector[1_000 + MIN_LOCK_MS],
             4_000_000_000,
         );
+        // The completing tranche buy leaves change: the event must report
+        // the actual spend (~threshold + 1% fee), not the gross budget.
+        let events =
+            sui::event::events_by_type<pool::TrancheLockedEvent<ZZZ_BASE, MOCK_QUOTE>>();
+        assert!(events.length() == 1);
+        let (quote_spent, base_locked) = pool::tranche_locked_event_amounts(&events[0]);
+        assert!(quote_spent < 4_000_000_000);
+        assert!(quote_spent >= THRESHOLD);
+        assert!(base_locked == I);
+
         scenario.next_tx(CREATOR);
         {
             let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
@@ -592,11 +605,11 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[100_000_000],
             vector[pool::lock_kind_time()],
-            vector[2_000_000],
+            vector[1_000 + MIN_LOCK_MS],
             100_000_000,
         );
 
-        clock.set_for_testing(2_000_000); // exactly at the unlock timestamp
+        clock.set_for_testing(1_000 + MIN_LOCK_MS); // exactly at the unlock timestamp
         scenario.next_tx(TRADER); // permissionless: anyone can trigger
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
@@ -624,10 +637,10 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[100_000_000],
             vector[pool::lock_kind_time()],
-            vector[2_000_000],
+            vector[1_000 + MIN_LOCK_MS],
             100_000_000,
         );
-        clock.set_for_testing(1_999_999);
+        clock.set_for_testing(1_000 + MIN_LOCK_MS - 1);
         scenario.next_tx(TRADER);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
@@ -646,10 +659,10 @@ module bondingcurvesui::lifecycle_tests {
             &clock,
             vector[100_000_000],
             vector[pool::lock_kind_time()],
-            vector[2_000_000],
+            vector[1_000 + MIN_LOCK_MS],
             100_000_000,
         );
-        clock.set_for_testing(3_000_000);
+        clock.set_for_testing(2_000 + MIN_LOCK_MS);
         scenario.next_tx(TRADER);
         {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();

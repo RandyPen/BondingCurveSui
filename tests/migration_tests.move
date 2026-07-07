@@ -24,11 +24,13 @@ module bondingcurvesui::migration_tests {
     const MIN_THRESHOLD: u64 = 1_000_000_000;
     const CREATION_FEE: u64 = 10_000_000;
     const MIN_BUY: u64 = 1_000;
+    const MIN_TVL_TARGET: u64 = 1_000;
 
-    // At graduation the CLMM pool holds ~THRESHOLD quote and ~R base priced
-    // at THRESHOLD/R, so TVL in quote is ~2 * THRESHOLD.
+    // The unlock condition is market cap: circulating supply (I + R = 10M
+    // tokens) x CLMM price (THRESHOLD / R at graduation), i.e. about
+    // 5 * THRESHOLD = 15e9 right after migration.
     const REACHABLE_TVL_TARGET: u64 = 5_000_000_000;
-    const UNREACHABLE_TVL_TARGET: u64 = 7_000_000_000;
+    const UNREACHABLE_TVL_TARGET: u64 = 20_000_000_000;
 
     // === Helpers (generic over the base coin to cover both orderings) ===
 
@@ -47,6 +49,7 @@ module bondingcurvesui::migration_tests {
                 MIN_THRESHOLD,
                 CREATION_FEE,
                 MIN_BUY,
+                MIN_TVL_TARGET,
             );
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
@@ -303,6 +306,7 @@ module bondingcurvesui::migration_tests {
             migration::do_unlock_tranche_tvl(
                 &mut pool,
                 &cetus_pool,
+                &currency,
                 0,
                 scenario.ctx(),
             );
@@ -339,6 +343,7 @@ module bondingcurvesui::migration_tests {
             migration::do_unlock_tranche_tvl_inverted(
                 &mut pool,
                 &cetus_pool,
+                &currency,
                 0,
                 scenario.ctx(),
             );
@@ -368,6 +373,7 @@ module bondingcurvesui::migration_tests {
             migration::do_unlock_tranche_tvl(
                 &mut pool,
                 &cetus_pool,
+                &currency,
                 0,
                 scenario.ctx(),
             );
@@ -395,7 +401,7 @@ module bondingcurvesui::migration_tests {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             let fake_pool =
                 scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, 0, scenario.ctx());
+            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0, scenario.ctx());
             ts::return_shared(pool);
             ts::return_shared(fake_pool);
         };
@@ -505,7 +511,7 @@ module bondingcurvesui::migration_tests {
             let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
             let fake_pool =
                 scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, 0, scenario.ctx());
+            migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0, scenario.ctx());
             ts::return_shared(pool);
             ts::return_shared(fake_pool);
         };

@@ -1,56 +1,75 @@
 # BondingCurveSui
 
-PumpFun 式代币发射平台（Sui Move），参考 moonbags-contracts-sui 重写并优化。
+A PumpFun-style token launchpad on Sui Move — a clean rewrite inspired by moonbags-contracts-sui, with different requirements and several structural optimizations.
 
-## 核心特性
+## Core features
 
-- **常数乘积虚拟储备曲线**：原生 u256/u128 数学，所有舍入偏向协议，每次交易断言不变量。
-- **quote coin 白名单**：管理员维护（`add_quote<Quote>` / `set_quote_enabled`），每种 quote 独立配置毕业阈值、创建费、最小买入额。`Pool<Base, Quote>` 双泛型。
-- **唯一毕业路径**：曲线打干后由任何人触发 `migrate`，全部流动性以 **full range** 进入 Cetus CLMM（`full_range_tick_range`），coin A/B 按类型名 ASCII 序在运行时分支。
-- **抢先建池防护（重要）**：发币时趁 TreasuryCap 还在手中（供应为零、无人持有 base 币）向 Cetus 铸 `PoolCreationCap` 并 `register_permission_pair`，迁移走 `create_pool_v3_with_creation_cap`。否则攻击者可用尘埃资金抢先创建同一 `(Base, Quote, tick_spacing)` 池，使迁移永久 `EPoolAlreadyExist`、募集资金卡死（安全评审发现的关键漏洞，已修复并有回归测试）。**运营前提**：白名单中的 quote 必须在 Cetus 的 `allowed_pair_config` 中允许对应 tick_spacing（主网默认 SUI@200；其他 quote 需 Cetus pool manager 执行 `add_allowed_pair_config`），否则 `create_token` 在发射时即中止。
-- **应急兜底**：若已完成的池因 Cetus 侧配置变化确实无法迁移，管理员可在完成后 **7 天宽限期**后 `emergency_withdraw`（资金入国库、池进入终态 HALTED、事件留痕）；HALTED 后所有 tranche 可无许可释放给创建者（TVL 条件已永久不可达）。宽限期内任何人仍可正常执行 `migrate`。
-- **LP Burn**：迁移后 Position 经 Cetus 官方 `lp_burn::burn_lp_v2` 销毁，`CetusLPBurnProof` 由协议（pool 对象）持有；任何人可触发 `claim_lp_fees`——quote 侧按可配置 bps 分给平台/创建者，**base 侧一律销毁**。
-- **Currency (BurnOnly)**：发币时铸完固定供应（默认 8M 曲线 + 2M LP，6 位小数）后：元数据 cap 领取并删除（永久冻结）、`make_supply_burn_only` 消耗 TreasuryCap。之后任何人可凭共享 `Currency<T>` 销毁 base coin，总供应链上可查。
-- **创建者首购 tranche**：发币时可分多笔（≤16）首购，每笔独立选择解锁条件：
-  - 时间锁（`unlock_tranche_time`，任意相位可解）；
-  - 迁移后 CLMM 池 TVL 达标（`unlock_tranche_tvl{,_inverted}`，**private entry** + 直接转给创建者，阻断同 PTB「拉价→解锁→卖出」原子操纵）。
-- **每池独立共享对象**：不同代币的交易互不争用；全局 `LaunchpadConfig` 仅存 `Base 类型 → pool ID` 注册表（防重复发射）。
-- **AdminCap 仅 `key`**：不可被 `public_transfer`/包装，只能通过 `transfer_admin` 转移。
+- **Constant-product bonding curve with virtual reserves**: native u256/u128 math, all rounding favors the protocol, the invariant is asserted on every trade.
+- **Quote coin whitelist**: admin-managed (`add_quote<Quote>` / `set_quote_enabled`), with per-quote graduation threshold, creation fee, minimum buy, and minimum market-cap unlock target. Pools are generic: `Pool<Base, Quote>`.
+- **Single graduation path**: once the curve drains, anyone can trigger `migrate`; all liquidity enters Cetus CLMM as a **full-range** position (`full_range_tick_range`), with the coin A/B assignment branched at runtime on the ASCII order of the type names.
+- **Front-run protection for pool creation (critical)**: while the TreasuryCap is still held at launch (zero supply, nobody owns base coins yet), `create_token` mints a Cetus `PoolCreationCap` and calls `register_permission_pair`; migration uses `create_pool_v3_with_creation_cap`. Without this, an attacker with dust amounts could create the `(Base, Quote, tick_spacing)` pool first and permanently brick migration with `EPoolAlreadyExist`, stranding all raised funds (found in security review; fixed with regression tests). **Operational precondition**: every whitelisted quote must be allowed in Cetus's `allowed_pair_config` for the configured tick_spacing (SUI@200 by default on mainnet; other quotes require Cetus's pool manager to run `add_allowed_pair_config`), otherwise launches abort.
+- **Emergency backstop**: a pool stuck in COMPLETED for **7 days** can be drained by the admin via `emergency_withdraw` (funds to treasury, pool enters the terminal HALTED phase, event logged); in HALTED every tranche becomes permissionlessly releasable to the creator (market-cap conditions are permanently unsatisfiable). **Trust note**: on-chain this only checks "COMPLETED + 7 days" — it cannot prove migration is impossible. The counterweight: `migrate` is permissionless and unpausable, so anyone can preempt the drain with one transaction; the platform must run a keeper that migrates on every `CurveCompletedEvent`, making the window moot in practice.
+- **Launch parameter guard rails**: `set_launch_params` enforces `initial/remain ≤ 1000` so extreme ratios cannot push the CLMM seed price outside Cetus's representable range and permanently block migration.
+- **LP burn**: after migration the position is burned through Cetus's official `lp_burn::burn_lp_v2`; the `CetusLPBurnProof` is held by the protocol (inside the pool object). Anyone can trigger `claim_lp_fees` — the quote side is split between platform treasury and creator by configurable bps, the **base side is always burned**.
+- **Currency (BurnOnly)**: at launch, after minting the fixed supply (default 8M curve + 2M LP, 6 decimals), the metadata cap is claimed and deleted (metadata frozen forever) and `make_supply_burn_only` consumes the TreasuryCap. Anyone can then burn base coins via the shared `Currency<T>`; total supply stays on-chain queryable and minting is impossible.
+- **Creator first-buy tranches**: up to 16 tranches at launch, each with its own unlock condition:
+  - time lock (`unlock_tranche_time`, unlockable in any phase), duration at least the admin-configured `min_lock_duration_ms` (default 1 hour);
+  - **market-cap target** (`unlock_tranche_tvl{,_inverted}`): circulating supply (the BurnOnly `Currency`'s `total_supply`, which decreases with burns) × Cetus pool price ≥ target (in quote units), target at least the per-quote `min_tvl_target`; only triggerable after migration; implemented as **private `entry`** functions that transfer directly to the creator, which breaks the atomic "pump price → unlock → dump" PTB composition. Note: base burns lower the market cap.
+- **Regulated-coin (honeypot) rejection**: `create_token` asserts `!coin_registry::is_regulated`. The legacy-migration path leaves the regulated state `Unknown` (a hidden DenyCap is undetectable on-chain), so the **platform must run a keeper**: on discovering a new coin's frozen `RegulatedCoinMetadata<T>` object, call the permissionless `coin_registry::migrate_regulated_state_by_metadata` to permanently mark it Regulated — a marked coin can never pass `create_token`, while honest coins have no such object and cannot be griefed. Frontends should filter on the same signal.
+- **Cetus incentive claiming**: `claim_lp_rewards{,_inverted}<Base, Quote, Reward>` collects rewarder incentives via `lp_burn::collect_reward`, split platform/creator by `lp_fee_platform_bps` (without this they would be stranded forever).
+- **One shared object per pool**: trades on different tokens never contend; the global `LaunchpadConfig` only keeps a `Base type → pool ID` registry (prevents duplicate launches).
+- **AdminCap is `key`-only**: cannot be `public_transfer`red or wrapped; the only way to move it is `transfer_admin`.
 
-## 生命周期（3 笔交易发币）
+## Lifecycle (3-transaction launch)
 
-1. **tx1**：创建者发布代币包（标准 OTW `coin::create_currency`，decimals 必须等于配置的 `base_decimals`），持有零供应 `TreasuryCap` + `CoinMetadata`。
-2. **tx2**：`sui::coin_registry::migrate_legacy_metadata`（无许可）在 `0xc` registry 创建共享 `Currency<Base>`。（同一交易中无法立刻 `&mut` 使用，故与 tx3 分离。）
-3. **tx3**：`pool::create_token<Base, Quote>`（或 `create_token_entry`，需传入 Cetus `GlobalConfig` + `Pools`）——校验、铸币、**预定 Cetus 池位（permission pair）**、冻结元数据、供应转 BurnOnly、推导虚拟储备、执行首购 tranche、共享 Pool。
+1. **tx1** — the creator publishes the coin package (standard OTW `coin::create_currency`; decimals must equal the configured `base_decimals`), holding a zero-supply `TreasuryCap` + `CoinMetadata`.
+2. **tx2** — `sui::coin_registry::migrate_legacy_metadata` (permissionless) creates the shared `Currency<Base>` in the `0xc` registry. (It cannot be used mutably in the same transaction that creates it, hence the split from tx3.)
+3. **tx3** — `pool::create_token<Base, Quote>` (or `create_token_entry`; takes Cetus `GlobalConfig` + `Pools`): validation, minting, **Cetus pool-key reservation (permission pair)**, metadata freeze, supply → BurnOnly, virtual-reserve derivation, creator first-buy tranches, pool shared.
 
-之后：`buy`/`sell`（exact-in + min-out）→ 曲线打干自动置 `COMPLETED` → 任何人 `migration::migrate`（传入 Cetus GlobalConfig/Pools + lp_burn BurnManager）→ `MIGRATED`；随后 `claim_lp_fees` / TVL 解锁生效。
+Afterwards: `buy`/`sell` (exact-in + min-out) → the draining buy flips the pool to `COMPLETED` → anyone calls `migration::migrate` (passing Cetus GlobalConfig/Pools + the lp_burn BurnManager) → `MIGRATED`; `claim_lp_fees` and market-cap unlocks become active.
 
-## 曲线参数
+## Curve parameters
 
-对 `I`（曲线实币）、`R`（LP 保留）、阈值 `T`（quote 单位）：
-`vb0 = I²/(I−R)`，`floor = vb0 − I`，`vq0 = ⌈T·R/(I−R)⌉`。
-打干时恰好卖出 `I`、募集 ≈`T`，曲线末价 = `T/R` = CLMM 初始价（无迁移价差，有单测验证）。
+For `I` (real curve tokens), `R` (tokens reserved for the LP), threshold `T` (quote units):
+`vb0 = I²/(I−R)`, `floor = vb0 − I`, `vq0 = ⌈T·R/(I−R)⌉`.
+Draining the curve sells exactly `I`, raises ≈`T`, and the final curve price `T/R` equals the CLMM seed price (no migration price gap; covered by unit tests).
 
-## 构建与测试
+## Developer skills (`skills/`)
+
+Hands-on guides for frontend/agent developers, used together with `deployments.json` at the repo root (fill in addresses after deployment):
+
+- **`launchpad-data`** — data retrieval: the event model (global events by field, pool-scoped events by `<Base, Quote>` generic type filters), cursor polling, K-line construction, object-state reads, and the post-migration handoff to noodles/Cetus charts;
+- **`launchpad-trade`** — trading PTBs: devInspect quoting + slippage, buy/sell moveCalls, the **atomic drain-buy + `migrate` in one PTB** pattern, and an abort-code table;
+- **`launchpad-launch`** — the full agent launch flow: bytecode-template coin package publishing → `migrate_legacy_metadata` Currency registration → `create_token` (tranche parameter encoding and constraints);
+- **`launchpad-keeper`** — platform operations: the two mandatory keepers (instant migration, regulated-coin marking), permissionless cranks (fee distribution / LP fees / rewards / unlocks), admin operations and an alerting checklist.
+
+To auto-load them as Claude Code project skills, symlink or copy the directories into `.claude/skills/`.
+
+## Build and test
 
 ```bash
 sui move build
-sui move test   # 71 tests
+sui move test   # 75 tests
 ```
 
-依赖说明见 `Move.toml` 注释：CetusClmm 直接钉在 MVR mainnet 解析出的同一坐标（cetus-contracts @ clmm-v14，真源码，单测可真实建池）；lp_burn 接口本地 vendor（`vendor/lp_burn`，剔除引发 MVR testnet 解析失败的 clmm_vester 传递依赖）。
+Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR resolves on mainnet (cetus-contracts @ clmm-v14 — real sources, so unit tests create real CLMM pools); the lp_burn interface is vendored locally (`vendor/lp_burn`) to drop its clmm_vester transitive dependency, whose MVR resolution fails outside mainnet.
 
-## 部署清单（testnet/mainnet 前必读）
+## Deployment checklist (read before testnet/mainnet)
 
-1. **published-at 刷新**：
-   - `mvr resolve @cetuspackages/clmm --network mainnet` → 最新 CLMM 包地址（2026-07-07 为 v14 `0x25ebb9a7c50eb17b3fa9c5a30fb8b5ad8f97caaf4928943acbcff7153dfee5e3`）。CetusClmm git 依赖无 published-at，主网发布前需以此地址配置（Move.lock env 固定或临时改用 `r.mvr` 依赖 + mainnet 环境）。
-   - `mvr resolve @cetuspackages/lpburn --network mainnet` → lp_burn 最新地址（2026-07-07 为 v7 `0xa5d8457e049c8f2a04b7b47e925b200f457e57016aa158f050a931c8ead99fe0`，已写入 `vendor/lp_burn/Move.toml`）。
-2. **testnet 限制**：Cetus 在 MVR 的 testnet 元数据缺失（clmm 无 git_info，lpburn 无映射）。lp_burn 在 testnet 的可用性需向 Cetus 文档确认；若不可用，`migrate` 的 burn 步骤只能在主网验证（本地单测已用真实 CLMM 源码覆盖建池部分）。
-3. **上线后首要动作**：`add_quote<SUI>` / `add_quote<USDC>` 等白名单；确认 Cetus `GlobalConfig` 中 `tick_spacing=200` fee tier 存在（主网默认 1%）；**逐一确认每个白名单 quote 已在 Cetus `allowed_pair_config` 允许该 tick_spacing**（SUI@200 主网默认已有，其余需联系 Cetus）。
-4. **实链冒烟**：发一个测试币走完 3 笔交易 → 小额买卖 → 打干 → `migrate`（核对 Cetus 池价格与 burn proof）→ `claim_lp_fees` 回路 → `coin_registry::burn` 减供应。
-5. **版本升级**：合约升级后调用 `bump_config_version`，并按需对存量池 `bump_pool_version`。
+1. **Refresh published-at addresses**:
+   - `mvr resolve @cetuspackages/clmm --network mainnet` → latest CLMM package (2026-07-07: v14 `0x25ebb9a7c50eb17b3fa9c5a30fb8b5ad8f97caaf4928943acbcff7153dfee5e3`). The CetusClmm git dependency carries no published-at; configure this address before a mainnet publish (Move.lock env pinning, or temporarily switch to an `r.mvr` dependency in a mainnet environment).
+   - `mvr resolve @cetuspackages/lpburn --network mainnet` → latest lp_burn package (2026-07-07: v7 `0xa5d8457e049c8f2a04b7b47e925b200f457e57016aa158f050a931c8ead99fe0`, already set in `vendor/lp_burn/Move.toml`).
+2. **Testnet limitations**: Cetus's MVR metadata is broken on testnet (clmm has no git_info; lpburn has no mapping). Confirm lp_burn's availability on testnet with Cetus docs; if unavailable, the burn step of `migrate` can only be verified on mainnet (local unit tests already cover pool creation against the real CLMM sources).
+3. **First actions after publish**: whitelist quotes (`add_quote<SUI>` / `add_quote<USDC>` …); confirm the `tick_spacing=200` fee tier exists in Cetus `GlobalConfig` (mainnet default, 1%); **verify each whitelisted quote is allowed in Cetus `allowed_pair_config` for that tick_spacing** (SUI@200 exists by default; others require contacting Cetus).
+4. **On-chain smoke test**: launch a test coin through the 3 transactions → small buys/sells → drain → `migrate` (verify the Cetus pool price and burn proof) → `claim_lp_fees` round trip → `coin_registry::burn` reduces supply.
+5. **Upgrades**: after a package upgrade call `bump_config_version`, and `bump_pool_version` per live pool as needed.
+6. **Two mandatory keepers**:
+   - Migration keeper: listen for `CurveCompletedEvent` and call `migrate` immediately (also neutralizes the 7-day emergency window);
+   - Regulated-marking keeper: watch for newly published frozen `RegulatedCoinMetadata<T>` objects and call `migrate_regulated_state_by_metadata` to permanently mark regulated coins before they can launch.
 
-## 已知取舍
+## Known trade-offs
 
-- TVL 解锁的跨交易价格操纵未做两段式确认（v1 接受：受益人只能是创建者，成本为 2×池费+滑点+被套利风险；事件记录当时 sqrt price 与余额供审计）。如需加固，v1.1 可加 poke→N 小时后确认的两段式解锁。
-- 手续费分润规则待定 → 全部为 admin 可配置 bps（曲线费率 ≤10% 硬顶；平台/创建者分成快照进池）。
+- Cross-transaction price manipulation of the market-cap unlock has no two-step confirmation (accepted for v1: the only beneficiary is the creator; cost is 2× pool fees + slippage + arbitrage risk; the event records the sqrt price, circulating supply and computed market cap for auditability). A v1.1 hardening could add a poke → confirm-after-N-hours flow.
+- A regulated coin's `Unknown` state cannot be refuted on-chain (the framework has no "prove no DenyCap exists" predicate); the on-chain assert only blocks revealed Regulated states — the rest of the loop is closed by the regulated-marking keeper (see deployment checklist).
+- The completing buy charges its fee on net cost while normal buys charge on gross input (a bps² -order inconsistency); not unified.
+- Fee-split rules are still TBD → everything is admin-configurable bps (curve fee hard-capped at 10%; platform/creator splits snapshotted into each pool at launch).

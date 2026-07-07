@@ -68,6 +68,8 @@ module bondingcurvesui::pool {
     const EGracePeriodActive: u64 = 21;
     /// Pool is not halted.
     const ENotHalted: u64 = 22;
+    /// Base coin is a regulated currency (has a deny cap).
+    const ERegulatedBase: u64 = 23;
 
     // === Constants ===
 
@@ -158,7 +160,7 @@ module bondingcurvesui::pool {
         tick_spacing: u32,
     }
 
-    public struct TrancheLockedEvent has copy, drop {
+    public struct TrancheLockedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         index: u64,
         kind: u8,
@@ -168,7 +170,11 @@ module bondingcurvesui::pool {
         base_locked: u64,
     }
 
-    public struct TradedEvent has copy, drop {
+    /// Generic over the coin pair so indexers can subscribe to one token's
+    /// trades directly via a MoveEventType filter (the creation event
+    /// instead carries the pair as TypeName fields, so a single event type
+    /// enumerates all launches).
+    public struct TradedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         trader: address,
         is_buy: bool,
@@ -180,25 +186,25 @@ module bondingcurvesui::pool {
         virtual_quote: u64,
     }
 
-    public struct CurveCompletedEvent has copy, drop {
+    public struct CurveCompletedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         quote_raised: u64,
     }
 
-    public struct CurveFeesDistributedEvent has copy, drop {
+    public struct CurveFeesDistributedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         platform_amount: u64,
         creator_amount: u64,
     }
 
-    public struct TrancheUnlockedEvent has copy, drop {
+    public struct TrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         index: u64,
         amount: u64,
         creator: address,
     }
 
-    public struct EmergencyWithdrawEvent has copy, drop {
+    public struct EmergencyWithdrawEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         base_amount: u64,
         quote_amount: u64,
@@ -255,6 +261,15 @@ module bondingcurvesui::pool {
         assert!(treasury_cap.total_supply() == 0, ESupplyNotZero);
         assert!(coin_registry::decimals(currency) == cfg.base_decimals(), EDecimalsMismatch);
         assert!(!coin_registry::is_metadata_cap_claimed(currency), EMetadataCapClaimed);
+        // Reject regulated base coins: a creator keeping a DenyCapV2 could
+        // deny-list every other holder and become the only address able to
+        // sell (honeypot). Note the legacy-migration path leaves the state
+        // Unknown and `is_regulated` false; a hidden deny cap is only
+        // rejected once someone reveals it by calling the permissionless
+        // `coin_registry::migrate_regulated_state_by_metadata` with the
+        // coin's frozen RegulatedCoinMetadata object — run a keeper that
+        // does this for every new coin before listing it (see README).
+        assert!(!coin_registry::is_regulated(currency), ERegulatedBase);
 
         // Mint the full fixed supply.
         let initial_base = cfg.initial_virtual_base();
@@ -336,6 +351,8 @@ module bondingcurvesui::pool {
             tranche_lock_kind,
             tranche_lock_param,
             &mut payment,
+            cfg.min_lock_duration_ms(),
+            quote_params.quote_min_tvl_target(),
             clock,
         );
 
@@ -384,6 +401,8 @@ module bondingcurvesui::pool {
         lock_kind: vector<u8>,
         lock_param: vector<u64>,
         payment: &mut Coin<Quote>,
+        min_lock_duration_ms: u64,
+        min_tvl_target: u64,
         clock: &Clock,
     ) {
         let count = quote_in.length();
@@ -395,10 +414,12 @@ module bondingcurvesui::pool {
         while (i < count) {
             let kind = lock_kind[i];
             let param = lock_param[i];
+            // Locks must be substantive, not nominal (e.g. now+1ms or a
+            // market-cap target of 1): admin-configured floors apply.
             if (kind == LOCK_KIND_TIME) {
-                assert!(param > clock.timestamp_ms(), EInvalidLockParam);
+                assert!(param >= clock.timestamp_ms() + min_lock_duration_ms, EInvalidLockParam);
             } else if (kind == LOCK_KIND_TVL) {
-                assert!(param > 0, EInvalidLockParam);
+                assert!(param >= min_tvl_target && param > 0, EInvalidLockParam);
             } else {
                 abort EInvalidLockKind
             };
@@ -410,6 +431,7 @@ module bondingcurvesui::pool {
             let (base_out, change) =
                 buy_internal(pool, payment.balance_mut().split(gross), creator, clock);
             // The completing tranche buy may leave unused quote; return it.
+            let quote_spent = gross - change.value();
             payment.balance_mut().join(change);
 
             let base_locked = base_out.value();
@@ -420,13 +442,13 @@ module bondingcurvesui::pool {
                 tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
                 claimed: false,
             });
-            event::emit(TrancheLockedEvent {
+            event::emit(TrancheLockedEvent<Base, Quote> {
                 pool_id: pool.id.to_inner(),
                 index: i,
                 kind,
                 unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
                 tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
-                quote_in: gross,
+                quote_in: quote_spent,
                 base_locked,
             });
             i = i + 1;
@@ -481,7 +503,7 @@ module bondingcurvesui::pool {
         let mut out = pool.quote_reserve.split(quote_out);
         pool.accrue_fee(out.split(fee));
 
-        event::emit(TradedEvent {
+        event::emit(TradedEvent<Base, Quote> {
             pool_id: pool.id.to_inner(),
             trader: ctx.sender(),
             is_buy: false,
@@ -534,10 +556,10 @@ module bondingcurvesui::pool {
         let net = gross - fee;
 
         let sellable = pool.virtual_base - pool.virtual_base_floor;
-        let preview_out = curve::buy_out_preview(pool.virtual_base, pool.virtual_quote, net);
-        assert!(preview_out > 0, EZeroOutput);
+        let (out, new_vb, new_vq) = curve::buy_out(pool.virtual_base, pool.virtual_quote, net);
+        assert!(out > 0, EZeroOutput);
 
-        let (base_out_amount, net_used, fee_used, new_vb, new_vq) = if (preview_out >= sellable) {
+        let (base_out_amount, net_used, fee_used, new_vb, new_vq) = if (out >= sellable) {
             // Completing buy: charge only what the remaining range costs.
             let (cost, new_vb, new_vq) = curve::buy_cost_exact_out(
                 pool.virtual_base,
@@ -546,8 +568,6 @@ module bondingcurvesui::pool {
             );
             (sellable, cost, curve::fee_amount(cost, pool.curve_fee_bps), new_vb, new_vq)
         } else {
-            let (out, new_vb, new_vq) =
-                curve::buy_out(pool.virtual_base, pool.virtual_quote, net);
             (out, net, fee, new_vb, new_vq)
         };
 
@@ -559,7 +579,7 @@ module bondingcurvesui::pool {
 
         let base_out = pool.base_reserve.split(base_out_amount);
 
-        event::emit(TradedEvent {
+        event::emit(TradedEvent<Base, Quote> {
             pool_id: pool.id.to_inner(),
             trader,
             is_buy: true,
@@ -573,7 +593,7 @@ module bondingcurvesui::pool {
         if (pool.virtual_base == pool.virtual_base_floor) {
             pool.phase = PHASE_COMPLETED;
             pool.completed_at_ms = clock.timestamp_ms();
-            event::emit(CurveCompletedEvent {
+            event::emit(CurveCompletedEvent<Base, Quote> {
                 pool_id: pool.id.to_inner(),
                 quote_raised: pool.quote_reserve.value(),
             });
@@ -615,7 +635,7 @@ module bondingcurvesui::pool {
             );
         };
         if (platform_amount > 0 || creator_amount > 0) {
-            event::emit(CurveFeesDistributedEvent {
+            event::emit(CurveFeesDistributedEvent<Base, Quote> {
                 pool_id: pool.id.to_inner(),
                 platform_amount,
                 creator_amount,
@@ -641,7 +661,7 @@ module bondingcurvesui::pool {
         assert!(tranche.kind == LOCK_KIND_TIME, ETrancheLocked);
         assert!(now >= tranche.unlock_ts_ms, ETrancheLocked);
         let unlocked = take_tranche(tranche);
-        event::emit(TrancheUnlockedEvent {
+        event::emit(TrancheUnlockedEvent<Base, Quote> {
             pool_id,
             index,
             amount: unlocked.value(),
@@ -652,11 +672,17 @@ module bondingcurvesui::pool {
 
     // === Emergency backstop ===
 
-    /// If a completed pool provably cannot migrate (e.g. the Cetus fee tier
-    /// for its tick_spacing disappeared), the admin may drain it to the
-    /// treasury for off-chain restitution — but only after a 7-day grace
-    /// period in which anyone could still have run the permissionless
-    /// `migrate` crank. Moves the pool to the terminal HALTED phase.
+    /// Backstop for a completed pool stuck unmigrated for 7 days (e.g. the
+    /// Cetus fee tier for its tick_spacing disappeared): the admin may drain
+    /// it to the treasury for off-chain restitution, moving the pool to the
+    /// terminal HALTED phase.
+    ///
+    /// TRUST NOTE: on-chain this only checks "COMPLETED + 7 days elapsed" —
+    /// it cannot prove migration is actually impossible. The counterweight
+    /// is that `migrate` is permissionless and unpausable, so anyone can
+    /// preempt the drain with a single transaction at any point in the
+    /// grace window; the platform must run a keeper that cranks `migrate`
+    /// on every CurveCompletedEvent, making this window moot in practice.
     public fun emergency_withdraw<Base, Quote>(
         _: &AdminCap,
         cfg: &LaunchpadConfig,
@@ -671,7 +697,7 @@ module bondingcurvesui::pool {
             EGracePeriodActive,
         );
         pool.phase = PHASE_HALTED;
-        event::emit(EmergencyWithdrawEvent {
+        event::emit(EmergencyWithdrawEvent<Base, Quote> {
             pool_id: pool.id.to_inner(),
             base_amount: base.value(),
             quote_amount: quote.value(),
@@ -695,7 +721,7 @@ module bondingcurvesui::pool {
         let pool_id = pool.id.to_inner();
         let tranche = pool.borrow_tranche_mut(index);
         let unlocked = take_tranche(tranche);
-        event::emit(TrancheUnlockedEvent {
+        event::emit(TrancheUnlockedEvent<Base, Quote> {
             pool_id,
             index,
             amount: unlocked.value(),
@@ -706,8 +732,10 @@ module bondingcurvesui::pool {
 
     // === Views ===
 
-    /// Quotes a buy: returns `(base_out, fee)` for a gross quote input.
+    /// Quotes a buy: returns `(base_out, fee)` for a gross quote input, or
+    /// `(0, 0)` when the curve is no longer trading.
     public fun quote_buy<Base, Quote>(pool: &Pool<Base, Quote>, quote_in: u64): (u64, u64) {
+        if (pool.phase != PHASE_TRADING) return (0, 0);
         let fee = curve::fee_amount(quote_in, pool.curve_fee_bps);
         let net = quote_in - fee;
         let sellable = pool.virtual_base - pool.virtual_base_floor;
@@ -724,8 +752,10 @@ module bondingcurvesui::pool {
         }
     }
 
-    /// Quotes a sell: returns `(net_quote_out, fee)` for a base input.
+    /// Quotes a sell: returns `(net_quote_out, fee)` for a base input, or
+    /// `(0, 0)` when the curve is no longer trading.
     public fun quote_sell<Base, Quote>(pool: &Pool<Base, Quote>, base_in: u64): (u64, u64) {
+        if (pool.phase != PHASE_TRADING) return (0, 0);
         let (quote_out, _, _) =
             curve::sell_out(pool.virtual_base, pool.virtual_quote, base_in);
         let fee = curve::fee_amount(quote_out, pool.curve_fee_bps);
@@ -876,7 +906,7 @@ module bondingcurvesui::pool {
         let tranche = pool.borrow_tranche_mut(index);
         assert!(tranche.kind == LOCK_KIND_TVL, ETrancheLocked);
         let unlocked = take_tranche(tranche);
-        event::emit(TrancheUnlockedEvent {
+        event::emit(TrancheUnlockedEvent<Base, Quote> {
             pool_id,
             index,
             amount: unlocked.value(),
@@ -928,5 +958,14 @@ module bondingcurvesui::pool {
         } else {
             coin.destroy_zero();
         }
+    }
+
+    // === Test helpers ===
+
+    #[test_only]
+    public fun tranche_locked_event_amounts<Base, Quote>(
+        ev: &TrancheLockedEvent<Base, Quote>,
+    ): (u64, u64) {
+        (ev.quote_in, ev.base_locked)
     }
 }

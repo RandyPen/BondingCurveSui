@@ -13,8 +13,10 @@ module bondingcurvesui::migration {
     use cetus_clmm::pool::{Self as clmm_pool, Pool as CetusPool};
     use cetus_clmm::pool_creator;
     use cetus_clmm::position::{Self, Position};
+    use cetus_clmm::rewarder::RewarderGlobalVault;
     use lp_burn::lp_burn::{Self, BurnManager};
     use std::string;
+    use std::type_name::{Self, TypeName};
     use sui::clock::Clock;
     use sui::coin::{Self, Coin};
     use sui::coin_registry::{Self, Currency};
@@ -35,7 +37,10 @@ module bondingcurvesui::migration {
 
     // === Events ===
 
-    public struct MigratedEvent has copy, drop {
+    /// Generic over the coin pair (like TradedEvent) so a per-token indexer
+    /// catches the migration with the same type-filter family and can
+    /// switch its price feed to the Cetus pool's own events.
+    public struct MigratedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         cetus_pool_id: ID,
         base_amount: u64,
@@ -47,21 +52,28 @@ module bondingcurvesui::migration {
         quote_dust_to_platform: u64,
     }
 
-    public struct LpFeesClaimedEvent has copy, drop {
+    public struct LpFeesClaimedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         base_burned: u64,
         quote_platform: u64,
         quote_creator: u64,
     }
 
-    public struct TvlTrancheUnlockedEvent has copy, drop {
+    public struct TvlTrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
         pool_id: ID,
         index: u64,
-        tvl_in_quote: u128,
+        /// Circulating supply (from the Currency) x CLMM price, in quote.
+        market_cap_in_quote: u128,
         tvl_target: u64,
         sqrt_price_x64: u128,
-        base_balance: u64,
-        quote_balance: u64,
+        total_supply: u64,
+    }
+
+    public struct LpRewardsClaimedEvent<phantom Base, phantom Quote> has copy, drop {
+        pool_id: ID,
+        reward_type: TypeName,
+        platform_amount: u64,
+        creator_amount: u64,
     }
 
     // === Migration ===
@@ -164,7 +176,7 @@ module bondingcurvesui::migration {
         let cetus_pool_id = position::pool_id(&position);
         pool::set_migrated(pool, cetus_pool_id, base_is_coin_a);
 
-        event::emit(MigratedEvent {
+        event::emit(MigratedEvent<Base, Quote> {
             pool_id: object::id(pool),
             cetus_pool_id,
             base_amount,
@@ -267,7 +279,7 @@ module bondingcurvesui::migration {
         };
         quote_fee.destroy_zero();
 
-        event::emit(LpFeesClaimedEvent {
+        event::emit(LpFeesClaimedEvent<Base, Quote> {
             pool_id: object::id(pool),
             base_burned,
             quote_platform,
@@ -282,28 +294,30 @@ module bondingcurvesui::migration {
     // commands of the same PTB, which breaks the atomic
     // "pump price -> unlock -> dump" composition.
 
-    /// Variant for launches where `Base` is the Cetus pool's coin A.
+    /// Variant for launches where `Base` is the Cetus pool's coin A. The
+    /// unlock condition is a MARKET CAP target: circulating supply (read
+    /// from the burn-only Currency, so burns lower it) times the CLMM price.
     entry fun unlock_tranche_tvl<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         cetus_pool: &CetusPool<Base, Quote>,
+        currency: &Currency<Base>,
         index: u64,
         ctx: &mut TxContext,
     ) {
-        do_unlock_tranche_tvl(pool, cetus_pool, index, ctx)
+        do_unlock_tranche_tvl(pool, cetus_pool, currency, index, ctx)
     }
 
     public(package) fun do_unlock_tranche_tvl<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         cetus_pool: &CetusPool<Base, Quote>,
+        currency: &Currency<Base>,
         index: u64,
         ctx: &mut TxContext,
     ) {
-        let (base_balance, quote_balance) = clmm_pool::balances(cetus_pool);
         unlock_tranche_tvl_internal(
             pool,
             object::id(cetus_pool),
-            base_balance.value(),
-            quote_balance.value(),
+            currency,
             clmm_pool::current_sqrt_price(cetus_pool),
             true,
             index,
@@ -315,24 +329,24 @@ module bondingcurvesui::migration {
     entry fun unlock_tranche_tvl_inverted<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         cetus_pool: &CetusPool<Quote, Base>,
+        currency: &Currency<Base>,
         index: u64,
         ctx: &mut TxContext,
     ) {
-        do_unlock_tranche_tvl_inverted(pool, cetus_pool, index, ctx)
+        do_unlock_tranche_tvl_inverted(pool, cetus_pool, currency, index, ctx)
     }
 
     public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         cetus_pool: &CetusPool<Quote, Base>,
+        currency: &Currency<Base>,
         index: u64,
         ctx: &mut TxContext,
     ) {
-        let (quote_balance, base_balance) = clmm_pool::balances(cetus_pool);
         unlock_tranche_tvl_internal(
             pool,
             object::id(cetus_pool),
-            base_balance.value(),
-            quote_balance.value(),
+            currency,
             clmm_pool::current_sqrt_price(cetus_pool),
             false,
             index,
@@ -343,8 +357,7 @@ module bondingcurvesui::migration {
     fun unlock_tranche_tvl_internal<Base, Quote>(
         pool: &mut Pool<Base, Quote>,
         cetus_pool_id: ID,
-        base_balance: u64,
-        quote_balance: u64,
+        currency: &Currency<Base>,
         sqrt_price_x64: u128,
         base_is_coin_a: bool,
         index: u64,
@@ -354,22 +367,106 @@ module bondingcurvesui::migration {
         pool.assert_migrated();
         assert!(pool.cetus_pool_id() == option::some(cetus_pool_id), EWrongCetusPool);
         assert!(pool.base_is_coin_a() == option::some(base_is_coin_a), EWrongOrientation);
+        pool::assert_burn_only_currency(currency);
 
-        let tvl = curve::tvl_in_quote(base_balance, quote_balance, sqrt_price_x64, base_is_coin_a);
+        // Market cap in quote units: circulating supply x CLMM price. The
+        // supply is authoritative (burn-only Currency, decreases with every
+        // base burn); tvl_in_quote with a zero quote leg computes exactly
+        // supply x price with staged u256 arithmetic.
+        let total_supply = coin_registry::total_supply(currency).destroy_some();
+        let market_cap =
+            curve::tvl_in_quote(total_supply, 0, sqrt_price_x64, base_is_coin_a);
         let target = pool::tranche_tvl_target(pool, index);
-        assert!(tvl >= (target as u128), ETvlBelowTarget);
+        assert!(market_cap >= (target as u128), ETvlBelowTarget);
 
         let (unlocked, creator) = pool::take_tvl_tranche(pool, index);
-        event::emit(TvlTrancheUnlockedEvent {
+        event::emit(TvlTrancheUnlockedEvent<Base, Quote> {
             pool_id: object::id(pool),
             index,
-            tvl_in_quote: tvl,
+            market_cap_in_quote: market_cap,
             tvl_target: target,
             sqrt_price_x64,
-            base_balance,
-            quote_balance,
+            total_supply,
         });
         transfer::public_transfer(unlocked.into_coin(ctx), creator);
+    }
+
+    // === Post-migration LP rewards (Cetus incentives) ===
+
+    /// Permissionless: collects Cetus rewarder incentives accrued to the
+    /// burned position and splits them like quote-side LP fees. Without
+    /// this, incentives on the pair would be stranded forever.
+    public fun claim_lp_rewards<Base, Quote, Reward>(
+        cfg: &LaunchpadConfig,
+        pool: &mut Pool<Base, Quote>,
+        burn_manager: &BurnManager,
+        cetus_config: &GlobalConfig,
+        cetus_pool: &mut CetusPool<Base, Quote>,
+        vault: &mut RewarderGlobalVault,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        assert_claimable(cfg, pool, object::id(cetus_pool), true);
+        let reward = lp_burn::collect_reward<Base, Quote, Reward>(
+            burn_manager,
+            cetus_config,
+            cetus_pool,
+            pool::borrow_burn_proof_mut(pool),
+            vault,
+            clock,
+            ctx,
+        );
+        settle_lp_rewards<Base, Quote, Reward>(cfg, pool, reward, ctx);
+    }
+
+    /// Variant for launches where `Base` is the Cetus pool's coin B.
+    public fun claim_lp_rewards_inverted<Base, Quote, Reward>(
+        cfg: &LaunchpadConfig,
+        pool: &mut Pool<Base, Quote>,
+        burn_manager: &BurnManager,
+        cetus_config: &GlobalConfig,
+        cetus_pool: &mut CetusPool<Quote, Base>,
+        vault: &mut RewarderGlobalVault,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        assert_claimable(cfg, pool, object::id(cetus_pool), false);
+        let reward = lp_burn::collect_reward<Quote, Base, Reward>(
+            burn_manager,
+            cetus_config,
+            cetus_pool,
+            pool::borrow_burn_proof_mut(pool),
+            vault,
+            clock,
+            ctx,
+        );
+        settle_lp_rewards<Base, Quote, Reward>(cfg, pool, reward, ctx);
+    }
+
+    fun settle_lp_rewards<Base, Quote, Reward>(
+        cfg: &LaunchpadConfig,
+        pool: &Pool<Base, Quote>,
+        mut reward: Coin<Reward>,
+        ctx: &mut TxContext,
+    ) {
+        let total = reward.value();
+        let platform_amount =
+            ((total as u128) * (pool.lp_fee_platform_bps() as u128)
+                / (config::bps_denominator() as u128)) as u64;
+        let creator_amount = total - platform_amount;
+        if (platform_amount > 0) {
+            transfer::public_transfer(reward.split(platform_amount, ctx), cfg.treasury());
+        };
+        if (creator_amount > 0) {
+            transfer::public_transfer(reward.split(creator_amount, ctx), pool.creator());
+        };
+        reward.destroy_zero();
+        event::emit(LpRewardsClaimedEvent<Base, Quote> {
+            pool_id: object::id(pool),
+            reward_type: type_name::with_defining_ids<Reward>(),
+            platform_amount,
+            creator_amount,
+        });
     }
 
     // === Internal ===

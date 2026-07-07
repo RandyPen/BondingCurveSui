@@ -58,6 +58,34 @@ module bondingcurvesui::mocks {
         coin::mint_for_testing<Q>(amount, ctx)
     }
 
+    /// A REGULATED base coin whose regulated state has been revealed on the
+    /// Currency (as a pre-launch keeper would do): create_token must reject
+    /// it.
+    public fun new_regulated_base_currency<T: drop>(
+        decimals: u8,
+        ctx: &mut TxContext,
+    ): (TreasuryCap<T>, Currency<T>) {
+        let otw = test_utils::create_one_time_witness<T>();
+        let (cap, deny_cap, metadata) = coin::create_regulated_currency_v2(
+            otw,
+            decimals,
+            b"TST",
+            b"Test Base",
+            b"regulated test base coin",
+            option::none(),
+            false,
+            ctx,
+        );
+        let mut registry = coin_registry::create_coin_data_registry_for_testing(ctx);
+        let mut currency =
+            coin_registry::migrate_legacy_metadata_for_testing(&mut registry, &metadata, ctx);
+        coin_registry::migrate_regulated_state_by_cap(&mut currency, &deny_cap);
+        coin_registry::share_for_testing(registry);
+        transfer::public_freeze_object(metadata);
+        transfer::public_transfer(deny_cap, ctx.sender());
+        (cap, currency)
+    }
+
     /// A local Cetus environment: GlobalConfig with the default 1% fee tier
     /// (tick_spacing 200), a Pools registry with an initialized
     /// permission-pair manager, and MOCK_QUOTE allowed as a permission-pair

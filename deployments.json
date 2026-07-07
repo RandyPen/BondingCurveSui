@@ -1,0 +1,34 @@
+{
+  "_comment": "Fill after each deployment. All skills reference this file. Do NOT guess addresses: launchpad ids come from the publish tx; Cetus shared-object ids (GlobalConfig/Pools/BurnManager/RewarderVault) come from Cetus docs or `mvr resolve @cetuspackages/clmm|lpburn`.",
+  "mainnet": {
+    "launchpadPackage": "",
+    "launchpadConfig": "",
+    "adminCap": "",
+    "cetusGlobalConfig": "",
+    "cetusPools": "",
+    "lpBurnManager": "",
+    "cetusRewarderVault": "",
+    "quotes": {}
+  },
+  "testnet": {
+    "launchpadPackage": "",
+    "launchpadConfig": "",
+    "adminCap": "",
+    "cetusGlobalConfig": "",
+    "cetusPools": "",
+    "lpBurnManager": "",
+    "cetusRewarderVault": "",
+    "quotes": {}
+  },
+  "constants": {
+    "coinRegistry": "0x000000000000000000000000000000000000000000000000000000000000000c",
+    "clock": "0x0000000000000000000000000000000000000000000000000000000000000006",
+    "baseDecimals": 6,
+    "lockKindTime": 0,
+    "lockKindTvl": 1,
+    "phaseTrading": 0,
+    "phaseCompleted": 1,
+    "phaseMigrated": 2,
+    "phaseHalted": 3
+  }
+}

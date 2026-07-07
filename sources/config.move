@@ -31,6 +31,9 @@ module bondingcurvesui::config {
     const BPS_DENOMINATOR: u64 = 10_000;
     /// Hard cap on the curve trading fee: 10%.
     const MAX_CURVE_FEE_BPS: u64 = 1_000;
+    /// Upper bound on initial_virtual_base / remain_base (see
+    /// set_launch_params).
+    const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
 
     // === Structs ===
 
@@ -55,6 +58,9 @@ module bondingcurvesui::config {
         creation_fee: u64,
         /// Minimum gross quote input per buy (dust guard).
         min_buy_amount: u64,
+        /// Minimum market-cap target (quote units) a creator may set on a
+        /// TVL-locked tranche; prevents nominal-only locks.
+        min_tvl_target: u64,
     }
 
     public struct LaunchpadConfig has key {
@@ -79,6 +85,9 @@ module bondingcurvesui::config {
         lp_fee_platform_bps: u64,
         /// Cetus fee-tier selector; must be a registered FeeTier on Cetus.
         tick_spacing: u32,
+        /// Minimum duration of a time-locked creator tranche; prevents
+        /// nominal-only locks.
+        min_lock_duration_ms: u64,
         /// Quote-coin whitelist.
         quotes: Table<TypeName, QuoteParams>,
         /// Base coin type -> pool object ID; enforces one launch per base.
@@ -108,6 +117,7 @@ module bondingcurvesui::config {
         initial_virtual_base: u64,
         remain_base: u64,
         tick_spacing: u32,
+        min_lock_duration_ms: u64,
     }
 
     public struct TreasuryUpdatedEvent has copy, drop {
@@ -139,6 +149,7 @@ module bondingcurvesui::config {
             curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
             lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
             tick_spacing: 200, // Cetus 1% fee tier
+            min_lock_duration_ms: 60 * 60 * 1000, // 1 hour
             quotes: table::new(ctx),
             pools: table::new(ctx),
         });
@@ -160,12 +171,14 @@ module bondingcurvesui::config {
         min_threshold: u64,
         creation_fee: u64,
         min_buy_amount: u64,
+        min_tvl_target: u64,
     ) {
         cfg.assert_version();
         let quote = type_name::with_defining_ids<Quote>();
         assert!(!cfg.quotes.contains(quote), EQuoteAlreadyListed);
         let params = new_quote_params(
             decimals, default_threshold, min_threshold, creation_fee, min_buy_amount,
+            min_tvl_target,
         );
         cfg.quotes.add(quote, params);
         event::emit(QuoteListedEvent { quote, params });
@@ -179,6 +192,7 @@ module bondingcurvesui::config {
         min_threshold: u64,
         creation_fee: u64,
         min_buy_amount: u64,
+        min_tvl_target: u64,
     ) {
         cfg.assert_version();
         let quote = type_name::with_defining_ids<Quote>();
@@ -186,6 +200,7 @@ module bondingcurvesui::config {
         let enabled = cfg.quotes[quote].enabled;
         let mut params = new_quote_params(
             decimals, default_threshold, min_threshold, creation_fee, min_buy_amount,
+            min_tvl_target,
         );
         params.enabled = enabled;
         *&mut cfg.quotes[quote] = params;
@@ -232,18 +247,28 @@ module bondingcurvesui::config {
         initial_virtual_base: u64,
         remain_base: u64,
         tick_spacing: u32,
+        min_lock_duration_ms: u64,
     ) {
         cfg.assert_version();
         assert!(remain_base > 0 && initial_virtual_base > remain_base, EInvalidLaunchParams);
+        // Keep the curve/migration inside Cetus's price envelope: an extreme
+        // initial/remain ratio can push the CLMM seed sqrt price out of the
+        // representable range and permanently block migration.
+        assert!(
+            initial_virtual_base / remain_base <= MAX_INITIAL_TO_REMAIN_RATIO,
+            EInvalidLaunchParams,
+        );
         cfg.base_decimals = base_decimals;
         cfg.initial_virtual_base = initial_virtual_base;
         cfg.remain_base = remain_base;
         cfg.tick_spacing = tick_spacing;
+        cfg.min_lock_duration_ms = min_lock_duration_ms;
         event::emit(LaunchParamsUpdatedEvent {
             base_decimals,
             initial_virtual_base,
             remain_base,
             tick_spacing,
+            min_lock_duration_ms,
         });
     }
 
@@ -320,6 +345,8 @@ module bondingcurvesui::config {
 
     public fun tick_spacing(cfg: &LaunchpadConfig): u32 { cfg.tick_spacing }
 
+    public fun min_lock_duration_ms(cfg: &LaunchpadConfig): u64 { cfg.min_lock_duration_ms }
+
     public fun is_paused(cfg: &LaunchpadConfig): bool { cfg.paused }
 
     public fun is_quote_listed(cfg: &LaunchpadConfig, quote: TypeName): bool {
@@ -349,6 +376,8 @@ module bondingcurvesui::config {
 
     public fun quote_min_buy_amount(params: &QuoteParams): u64 { params.min_buy_amount }
 
+    public fun quote_min_tvl_target(params: &QuoteParams): u64 { params.min_tvl_target }
+
     // === Internal ===
 
     fun new_quote_params(
@@ -357,6 +386,7 @@ module bondingcurvesui::config {
         min_threshold: u64,
         creation_fee: u64,
         min_buy_amount: u64,
+        min_tvl_target: u64,
     ): QuoteParams {
         assert!(default_threshold >= min_threshold && min_threshold > 0, EThresholdTooLow);
         QuoteParams {
@@ -366,6 +396,7 @@ module bondingcurvesui::config {
             min_threshold,
             creation_fee,
             min_buy_amount,
+            min_tvl_target,
         }
     }
 

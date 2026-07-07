@@ -19,6 +19,8 @@ module bondingcurvesui::hardening_tests {
     const MIN_THRESHOLD: u64 = 1_000_000_000;
     const CREATION_FEE: u64 = 10_000_000;
     const MIN_BUY: u64 = 1_000;
+    const MIN_TVL_TARGET: u64 = 1_000;
+    const MIN_LOCK_MS: u64 = 60 * 60 * 1000; // config default
 
     fun setup(): (Scenario, Clock) {
         let mut scenario = ts::begin(ADMIN);
@@ -35,6 +37,7 @@ module bondingcurvesui::hardening_tests {
                 MIN_THRESHOLD,
                 CREATION_FEE,
                 MIN_BUY,
+                MIN_TVL_TARGET,
             );
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
@@ -161,7 +164,7 @@ module bondingcurvesui::hardening_tests {
         while (i < 17) {
             quote_in.push_back(1_000_000);
             kinds.push_back(pool::lock_kind_time());
-            params.push_back(1_000_000);
+            params.push_back(1_000 + MIN_LOCK_MS);
             i = i + 1;
         };
         try_create(&mut scenario, &clock, option::none(), quote_in, kinds, params, 20_000_000, 0);
@@ -213,10 +216,102 @@ module bondingcurvesui::hardening_tests {
             option::none(),
             vector[10_000_000],
             vector[pool::lock_kind_time()],
-            vector[1_000_000],
+            vector[1_000 + MIN_LOCK_MS],
             9_999_999, // one short
             0,
         );
+        clock.destroy_for_testing();
+        scenario.end();
+    }
+
+    #[test, expected_failure(abort_code = pool::EInvalidLockParam)]
+    fun create_rejects_tvl_target_below_minimum() {
+        let (mut scenario, clock) = setup();
+        try_create(
+            &mut scenario,
+            &clock,
+            option::none(),
+            vector[1_000_000],
+            vector[pool::lock_kind_tvl()],
+            vector[MIN_TVL_TARGET - 1],
+            1_000_000,
+            0,
+        );
+        clock.destroy_for_testing();
+        scenario.end();
+    }
+
+    // === Regulated base coin (honeypot) rejection ===
+
+    #[test, expected_failure(abort_code = pool::ERegulatedBase)]
+    fun create_rejects_regulated_base() {
+        let (mut scenario, clock) = setup();
+        scenario.next_tx(@0x0);
+        let (cap, mut currency) =
+            mocks::new_regulated_base_currency<ZZZ_BASE>(6, scenario.ctx());
+        scenario.next_tx(CREATOR);
+        let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+        let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
+            &mut cfg,
+            &mut currency,
+            cap,
+            mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
+            option::none(),
+            vector[],
+            vector[],
+            vector[],
+            mocks::mint_quote<MOCK_QUOTE>(0, scenario.ctx()),
+            cetus_config,
+            cetus_pools,
+            &clock,
+            scenario.ctx(),
+        );
+        transfer::public_transfer(change, CREATOR);
+        ts::return_shared(cfg);
+        mocks::destroy_cetus_env(cetus_env);
+        unit_test::destroy(currency);
+        clock.destroy_for_testing();
+        scenario.end();
+    }
+
+    // === Launch parameter guard rails ===
+
+    #[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+    fun launch_params_reject_extreme_ratio() {
+        let (mut scenario, clock) = setup();
+        scenario.next_tx(ADMIN);
+        {
+            let admin_cap = scenario.take_from_sender<AdminCap>();
+            let mut cfg = scenario.take_shared<LaunchpadConfig>();
+            // initial/remain ratio of 2000 exceeds the 1000 cap.
+            config::set_launch_params(
+                &admin_cap, &mut cfg, 6, 2_000_000_000, 1_000_000, 200, 0,
+            );
+            scenario.return_to_sender(admin_cap);
+            ts::return_shared(cfg);
+        };
+        clock.destroy_for_testing();
+        scenario.end();
+    }
+
+    // === Quote views after completion ===
+
+    #[test]
+    fun quote_views_zero_when_not_trading() {
+        let (mut scenario, mut clock) = setup();
+        clock.set_for_testing(1_000_000);
+        complete_with_tvl_tranche(&mut scenario, &clock);
+        scenario.next_tx(CREATOR);
+        {
+            let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+            let (out, fee) = pool.quote_buy(100_000_000);
+            assert!(out == 0 && fee == 0);
+            let (out2, fee2) = pool.quote_sell(100_000_000);
+            assert!(out2 == 0 && fee2 == 0);
+            ts::return_shared(pool);
+        };
         clock.destroy_for_testing();
         scenario.end();
     }
@@ -281,7 +376,7 @@ module bondingcurvesui::hardening_tests {
         {
             let admin_cap = scenario.take_from_sender<AdminCap>();
             let mut cfg = scenario.take_shared<LaunchpadConfig>();
-            config::add_quote<MOCK_QUOTE>(&admin_cap, &mut cfg, 6, 1_000, 1_000, 0, 1);
+            config::add_quote<MOCK_QUOTE>(&admin_cap, &mut cfg, 6, 1_000, 1_000, 0, 1, 1);
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
         };
@@ -328,7 +423,7 @@ module bondingcurvesui::hardening_tests {
         {
             let admin_cap = scenario.take_from_sender<AdminCap>();
             let mut cfg = scenario.take_shared<LaunchpadConfig>();
-            config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200);
+            config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0);
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
         };
