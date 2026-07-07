@@ -119,9 +119,10 @@ What tx3 does besides minting: reserves the Cetus pool key (permission pair — 
 ## After launch (agent lifecycle)
 
 - Trade: `launchpad-trade` skill. Watch your pool via `TradedEvent<Base, Quote>` (`launchpad-data` skill).
-- Creator-only maintenance (both check `ctx.sender() == pool.creator`):
+- Creator-only maintenance (all check `ctx.sender() == pool.creator`):
   - `pool::update_project_info(pool, description, twitter, telegram, website)` — full replace of the pool's project info; emits `ProjectInfoUpdatedEvent<Base, Quote>`.
   - `pool::update_base_metadata(pool, currency, name?, description?, icon_url?)` — updates the coin's Currency metadata through the pool-held MetadataCap (symbol immutable; pass none to leave a field unchanged).
+  - `pool::nominate_creator(pool, to)` / `pool::cancel_creator_nomination(pool)` — two-step transfer of the whole creator role (creator fee/reward share, future tranche unlocks including already-locked tranches, and both maintenance rights above). The nomination is inert until the nominee calls `pool::accept_creator(pool)`; until then the current creator keeps every right. Events: `CreatorNominatedEvent` / `CreatorNominationCancelledEvent` / `CreatorTransferredEvent` (all `<Base, Quote>`).
 - On drain: attach `migration::migrate` to the completing buy, or crank it separately (`launchpad-keeper` skill).
 - Unlock tranches: time — `pool::unlock_tranche_time(pool, index, clock)` (permissionless, pays the creator); market-cap — `migration::unlock_tranche_tvl{,_inverted}(pool, cetus_pool, currency, index)` (private `entry`; call as a direct PTB command; requires MIGRATED and circulating-supply × price ≥ target; `Pool.base_is_coin_a` decides which variant).
 

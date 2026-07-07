@@ -43,8 +43,8 @@
     "launchpadPackage": "",
     "launchpadConfig": "",
     "adminCap": "",
-    "cetusGlobalConfig": "0x9774e359588ead122af1c7e7f64e14ade261cfeecdb5d0eb4a5b3b4c8ab8bd3e",
-    "cetusPools": "",
+    "cetusGlobalConfig": "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a",
+    "cetusPools": "0x20a086e6fa0741b3ca77d033a65faf0871349b986ddbdde6fa1d85d78a5f4222",
     "lpBurnManager": "0xd04529ef15b7dad6699ee905daca0698858cab49724b2b2a1fc6b1ebc5e474ef",
     "cetusRewarderVault": "0xf78d2ee3c312f298882cb680695e5e8c81b1d441a646caccc058006c2851ddea",
     "quotes": {},
@@ -60,6 +60,7 @@
     "phaseCompleted": 1,
     "phaseMigrated": 2,
     "totalSupply": "1_000_000_000 tokens @6dec: 800M curve (8e14) + 200M CLMM LP (2e14)",
-    "tvlTargetMultiplierDefault": 3
+    "tvlTargetMultiplierDefault": 3,
+    "migrationFeeBpsDefault": 500
   }
 }

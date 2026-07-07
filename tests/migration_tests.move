@@ -130,13 +130,15 @@ fun launch_and_complete<B: drop>(
 }
 
 /// Runs migrate_for_testing (everything except the lp_burn step) and
-/// destroys the returned raw Position.
+/// destroys the returned raw Position. Returns the MigratedEvent's
+/// `(quote_amount, migration_fee, base_burned)` (events are only
+/// readable within the emitting transaction).
 fun migrate<B: drop>(
     scenario: &mut Scenario,
     clock: &Clock,
     cetus_env: &mut mocks::CetusEnv,
     currency: &mut Currency<B>,
-) {
+): (u64, u64, u64) {
     scenario.next_tx(TRADER); // permissionless crank
     let cfg = scenario.take_shared<LaunchpadConfig>();
     let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
@@ -150,9 +152,18 @@ fun migrate<B: drop>(
         clock,
         scenario.ctx(),
     );
+    // The base coin's icon must land on the Position NFT.
+    assert!(cetus_clmm::position::url(&position) == mocks::base_icon_url().to_string());
+    // Migration fee: exactly the snapshotted bps of the gross raise.
+    let events = sui::event::events_by_type<migration::MigratedEvent<B, MOCK_QUOTE>>();
+    assert!(events.length() == 1);
+    let (quote_raised, migration_fee, base_burned, _) =
+        migration::migrated_event_amounts(&events[0]);
+    assert!(migration_fee == curve::fee_amount(quote_raised, pool.migration_fee_bps()));
     ts::return_shared(cfg);
     ts::return_shared(pool);
     unit_test::destroy(position);
+    (quote_raised, migration_fee, base_burned)
 }
 
 fun end<B>(
@@ -238,7 +249,8 @@ fun migrate_straight_order_creates_full_range_pool() {
     // ZZZ_BASE > MOCK_QUOTE in ASCII order: base becomes coin A.
     let mut currency = launch_and_complete<ZZZ_BASE>(&mut scenario, &clock, &mut cetus_env, option::none());
     let supply_before = coin_registry::total_supply(&currency).destroy_some();
-    migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+    let (quote_raised, migration_fee, base_burned) =
+        migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
 
     scenario.next_tx(TRADER);
     {
@@ -248,15 +260,23 @@ fun migrate_straight_order_creates_full_range_pool() {
         assert!(pool.base_is_coin_a() == option::some(true));
         assert!(pool.cetus_pool_id() == option::some(object::id(&cetus_pool)));
 
-        // The CLMM pool holds the graduation liquidity.
+        // The CLMM pool holds the graduation liquidity net of the fee:
+        // both legs shrink by the fee ratio. Quote side seeded fully
+        // (net); the base leg may additionally lose ~1e-6 relative to
+        // isqrt/liquidity flooring.
         let (base_bal, quote_bal) = cetus_clmm::pool::balances(&cetus_pool);
         assert!(base_bal.value() > 0 && quote_bal.value() > 0);
-        // Base side seeded fully; quote may lose ~1e-9 relative to
-        // isqrt/liquidity flooring (that dust accrues to the platform).
-        assert!(base_bal.value() + 10 >= R);
-        assert!(quote_bal.value() >= THRESHOLD - THRESHOLD / 1_000_000);
+        let quote_net = quote_raised - migration_fee;
+        assert!(quote_bal.value() >= quote_net - quote_net / 1_000_000);
+        let base_expected = (
+            (R as u128) * (quote_net as u128) / (quote_raised as u128)
+        ) as u64;
+        assert!(base_bal.value() + 10 >= base_expected - base_expected / 1_000_000);
+        // Base conservation: seeded + burned covers the reserve.
+        assert!(base_bal.value() + base_burned + 10 >= R);
 
-        // Pool price matches the curve's end price sqrt(T/R).
+        // Gap-free graduation: pool price still matches the curve's end
+        // price sqrt(T/R) despite the fee.
         let expected_sqrt = curve::initial_sqrt_price_x64(R, THRESHOLD);
         let actual_sqrt = cetus_clmm::pool::current_sqrt_price(&cetus_pool);
         let diff = if (expected_sqrt > actual_sqrt) {
@@ -275,9 +295,9 @@ fun migrate_straight_order_creates_full_range_pool() {
         ts::return_shared(cetus_pool);
     };
 
-    // Any base dust was burned, never parked anywhere.
+    // The excess base (fee mirror + dust) was burned, never parked.
     let supply_after = coin_registry::total_supply(&currency).destroy_some();
-    assert!(supply_after <= supply_before);
+    assert!(supply_before - supply_after == base_burned);
     end(scenario, clock, cetus_env, currency);
 }
 
@@ -286,7 +306,8 @@ fun migrate_inverted_order_creates_full_range_pool() {
     let (mut scenario, clock, mut cetus_env) = setup();
     // AAA_BASE < MOCK_QUOTE in ASCII order: base becomes coin B.
     let mut currency = launch_and_complete<AAA_BASE>(&mut scenario, &clock, &mut cetus_env, option::none());
-    migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+    let (quote_raised, migration_fee, base_burned) =
+        migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
 
     scenario.next_tx(TRADER);
     {
@@ -297,8 +318,9 @@ fun migrate_inverted_order_creates_full_range_pool() {
         assert!(pool.cetus_pool_id() == option::some(object::id(&cetus_pool)));
 
         let (quote_bal, base_bal) = cetus_clmm::pool::balances(&cetus_pool);
-        assert!(base_bal.value() + 10 >= R);
-        assert!(quote_bal.value() >= THRESHOLD - THRESHOLD / 1_000_000);
+        let quote_net = quote_raised - migration_fee;
+        assert!(quote_bal.value() >= quote_net - quote_net / 1_000_000);
+        assert!(base_bal.value() + base_burned + 10 >= R);
 
         // Inverted orientation: price = base per quote = R / THRESHOLD.
         let expected_sqrt = curve::initial_sqrt_price_x64(THRESHOLD, R);
@@ -309,6 +331,36 @@ fun migrate_inverted_order_creates_full_range_pool() {
             actual_sqrt - expected_sqrt
         };
         assert!(diff <= expected_sqrt / 1_000_000);
+        ts::return_shared(pool);
+        ts::return_shared(cetus_pool);
+    };
+    end(scenario, clock, cetus_env, currency);
+}
+
+#[test]
+fun migrate_with_zero_fee_seeds_full_amounts() {
+    let (mut scenario, clock, mut cetus_env) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 7_000, 5_000, 0);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    let mut currency = launch_and_complete<ZZZ_BASE>(&mut scenario, &clock, &mut cetus_env, option::none());
+    let (quote_raised, migration_fee, base_burned) =
+        migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+    // Pre-fee behavior restored: no fee, full seeding, dust-only burn.
+    assert!(migration_fee == 0);
+    assert!(base_burned <= 10);
+    scenario.next_tx(TRADER);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
+        let (base_bal, quote_bal) = cetus_clmm::pool::balances(&cetus_pool);
+        assert!(base_bal.value() + 10 >= R);
+        assert!(quote_bal.value() >= quote_raised - quote_raised / 1_000_000);
         ts::return_shared(pool);
         ts::return_shared(cetus_pool);
     };

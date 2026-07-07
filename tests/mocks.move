@@ -32,6 +32,13 @@ module bondingcurvesui::mocks {
     use sui::coin::{Self, Coin, TreasuryCap};
     use sui::coin_registry::{Self, Currency};
     use sui::test_utils;
+    use sui::url;
+
+    const BASE_ICON_URL: vector<u8> = b"https://example.com/base-icon.png";
+
+    /// Icon URL every mock base Currency carries; migration is expected to
+    /// stamp it onto the Cetus Position NFT.
+    public fun base_icon_url(): vector<u8> { BASE_ICON_URL }
 
     /// Creates a fresh base coin exactly like a launch's transactions 1+2
     /// would: publish (create_currency) then register a Currency via legacy
@@ -44,7 +51,7 @@ module bondingcurvesui::mocks {
             b"TST",
             b"Test Base",
             b"launchpad test base coin",
-            option::none(),
+            option::some(url::new_unsafe_from_bytes(BASE_ICON_URL)),
             ctx,
         );
         let mut registry = coin_registry::create_coin_data_registry_for_testing(ctx);

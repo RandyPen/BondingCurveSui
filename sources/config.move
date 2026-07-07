@@ -32,6 +32,8 @@ const VERSION: u64 = 1;
 const BPS_DENOMINATOR: u64 = 10_000;
 /// Hard cap on the curve trading fee: 10%.
 const MAX_CURVE_FEE_BPS: u64 = 1_000;
+/// Hard cap on the migration (graduation) fee: 10%.
+const MAX_MIGRATION_FEE_BPS: u64 = 1_000;
 /// Upper bound on initial_virtual_base / remain_base (see
 /// set_launch_params).
 const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
@@ -84,6 +86,10 @@ public struct LaunchpadConfig has key {
     /// Platform share of post-migration quote-side LP fees; remainder to
     /// the creator. Base-side LP fees are always burned.
     lp_fee_platform_bps: u64,
+    /// Platform fee on the raised quote, taken at migration. Both CLMM
+    /// seed legs shrink by the same ratio (price gap-free) and the
+    /// excess base is burned.
+    migration_fee_bps: u64,
     /// Cetus fee-tier selector; must be a registered FeeTier on Cetus.
     tick_spacing: u32,
     /// Minimum duration of a time-locked creator tranche; prevents
@@ -115,6 +121,7 @@ public struct FeeParamsUpdatedEvent has copy, drop {
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
     lp_fee_platform_bps: u64,
+    migration_fee_bps: u64,
 }
 
 public struct LaunchParamsUpdatedEvent has copy, drop {
@@ -154,6 +161,7 @@ fun init(ctx: &mut TxContext) {
         curve_fee_bps: 100, // 1%
         curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
         lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
+        migration_fee_bps: 500, // 5% of the raise, at graduation
         tick_spacing: 200, // Cetus 1% fee tier
         min_lock_duration_ms: 24 * 60 * 60 * 1000, // 24 hours
         tvl_target_multiplier: 3,
@@ -232,18 +240,22 @@ public fun set_fee_params(
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
     lp_fee_platform_bps: u64,
+    migration_fee_bps: u64,
 ) {
     cfg.assert_version();
     assert!(curve_fee_bps <= MAX_CURVE_FEE_BPS, EFeeTooHigh);
     assert!(curve_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
     assert!(lp_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
+    assert!(migration_fee_bps <= MAX_MIGRATION_FEE_BPS, EFeeTooHigh);
     cfg.curve_fee_bps = curve_fee_bps;
     cfg.curve_fee_platform_bps = curve_fee_platform_bps;
     cfg.lp_fee_platform_bps = lp_fee_platform_bps;
+    cfg.migration_fee_bps = migration_fee_bps;
     event::emit(FeeParamsUpdatedEvent {
         curve_fee_bps,
         curve_fee_platform_bps,
         lp_fee_platform_bps,
+        migration_fee_bps,
     });
 }
 
@@ -353,6 +365,8 @@ public fun curve_fee_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_bps }
 public fun curve_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_platform_bps }
 
 public fun lp_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.lp_fee_platform_bps }
+
+public fun migration_fee_bps(cfg: &LaunchpadConfig): u64 { cfg.migration_fee_bps }
 
 public fun tick_spacing(cfg: &LaunchpadConfig): u32 { cfg.tick_spacing }
 

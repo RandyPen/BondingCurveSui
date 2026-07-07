@@ -76,6 +76,10 @@ const ERegulatedBase: u64 = 23;
 const ENotCreator: u64 = 24;
 /// A project-info field exceeds its length limit.
 const EProjectInfoTooLong: u64 = 25;
+/// Caller is not the nominated pending creator.
+const ENotPendingCreator: u64 = 26;
+/// No creator nomination is pending.
+const ENoPendingCreator: u64 = 27;
 
 // === Constants ===
 
@@ -124,6 +128,9 @@ public struct Pool<phantom Base, phantom Quote> has key {
     id: UID,
     version: u64,
     creator: address,
+    /// Nominated next creator (two-step transfer); `creator` keeps every
+    /// right until the nominee accepts.
+    pending_creator: Option<address>,
     phase: u8,
     // Curve state.
     virtual_base: u64,
@@ -146,6 +153,7 @@ public struct Pool<phantom Base, phantom Quote> has key {
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
     lp_fee_platform_bps: u64,
+    migration_fee_bps: u64,
     tick_spacing: u32,
     min_buy_amount: u64,
     /// Project description and social links; creator-updatable.
@@ -226,6 +234,24 @@ public struct TrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
     index: u64,
     amount: u64,
     creator: address,
+}
+
+public struct CreatorNominatedEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    creator: address,
+    nominee: address,
+}
+
+public struct CreatorNominationCancelledEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    creator: address,
+    nominee: address,
+}
+
+public struct CreatorTransferredEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    from: address,
+    to: address,
 }
 
 // === Token creation ===
@@ -332,6 +358,7 @@ public fun create_token<Base, Quote>(
         id: object::new(ctx),
         version: VERSION,
         creator: ctx.sender(),
+        pending_creator: option::none(),
         phase: PHASE_TRADING,
         virtual_base,
         virtual_quote,
@@ -345,6 +372,7 @@ public fun create_token<Base, Quote>(
         curve_fee_bps: cfg.curve_fee_bps(),
         curve_fee_platform_bps: cfg.curve_fee_platform_bps(),
         lp_fee_platform_bps: cfg.lp_fee_platform_bps(),
+        migration_fee_bps: cfg.migration_fee_bps(),
         tick_spacing: cfg.tick_spacing(),
         min_buy_amount: quote_params.quote_min_buy_amount(),
         project: new_project_info(description, twitter, telegram, website),
@@ -708,6 +736,64 @@ public fun unlock_tranche_time<Base, Quote>(
     balance::send_funds(unlocked, creator);
 }
 
+// === Creator role ===
+
+// Two-step transfer of the whole creator role: the creator share of
+// curve/LP fees and rewards, future tranche unlocks (including tranches
+// locked before the transfer), and the project info / base metadata
+// update rights. Nothing changes hands until the nominee accepts —
+// while a nomination is pending, every right stays with the current
+// creator, and a typo'd address can never take the role.
+
+/// Creator-only: nominate the next creator. Overwrites any pending
+/// nomination.
+public fun nominate_creator<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    to: address,
+    ctx: &TxContext,
+) {
+    pool.assert_pool_version();
+    assert!(ctx.sender() == pool.creator, ENotCreator);
+    pool.pending_creator = option::some(to);
+    event::emit(CreatorNominatedEvent<Base, Quote> {
+        pool_id: pool.id.to_inner(),
+        creator: pool.creator,
+        nominee: to,
+    });
+}
+
+/// Creator-only: withdraw the pending nomination.
+public fun cancel_creator_nomination<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    ctx: &TxContext,
+) {
+    pool.assert_pool_version();
+    assert!(ctx.sender() == pool.creator, ENotCreator);
+    assert!(pool.pending_creator.is_some(), ENoPendingCreator);
+    let nominee = pool.pending_creator.extract();
+    event::emit(CreatorNominationCancelledEvent<Base, Quote> {
+        pool_id: pool.id.to_inner(),
+        creator: pool.creator,
+        nominee,
+    });
+}
+
+/// Nominee-only: complete the transfer and take over the creator role.
+public fun accept_creator<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    ctx: &TxContext,
+) {
+    pool.assert_pool_version();
+    assert!(pool.pending_creator == option::some(ctx.sender()), ENotPendingCreator);
+    pool.pending_creator = option::none();
+    event::emit(CreatorTransferredEvent<Base, Quote> {
+        pool_id: pool.id.to_inner(),
+        from: pool.creator,
+        to: ctx.sender(),
+    });
+    pool.creator = ctx.sender();
+}
+
 // === Project info ===
 
 /// Creator-only: replace the pool's project description and links.
@@ -819,6 +905,10 @@ public fun phase<Base, Quote>(pool: &Pool<Base, Quote>): u8 { pool.phase }
 
 public fun creator<Base, Quote>(pool: &Pool<Base, Quote>): address { pool.creator }
 
+public fun pending_creator<Base, Quote>(pool: &Pool<Base, Quote>): Option<address> {
+    pool.pending_creator
+}
+
 public fun threshold<Base, Quote>(pool: &Pool<Base, Quote>): u64 { pool.threshold }
 
 public fun virtual_reserves<Base, Quote>(pool: &Pool<Base, Quote>): (u64, u64, u64) {
@@ -859,6 +949,10 @@ public fun cetus_pool_id<Base, Quote>(pool: &Pool<Base, Quote>): Option<ID> {
 
 public fun base_is_coin_a<Base, Quote>(pool: &Pool<Base, Quote>): Option<bool> {
     pool.base_is_coin_a
+}
+
+public fun migration_fee_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
+    pool.migration_fee_bps
 }
 
 public fun lp_fee_platform_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {

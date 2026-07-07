@@ -402,7 +402,22 @@ fun fee_params_capped_at_ten_percent() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 1_001, 5_000, 5_000);
+        config::set_fee_params(&admin_cap, &mut cfg, 1_001, 5_000, 5_000, 500);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = config::EFeeTooHigh)]
+fun migration_fee_capped_at_max() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 5_000, 5_000, 1_001);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -417,7 +432,7 @@ fun fee_split_capped_at_bps_denominator() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 100, 10_001, 5_000);
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 10_001, 5_000, 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };

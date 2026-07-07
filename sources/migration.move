@@ -16,7 +16,6 @@ use cetus_clmm::pool_creator;
 use cetus_clmm::position::{Self, Position};
 use cetus_clmm::rewarder::RewarderGlobalVault;
 use lp_burn::lp_burn::{Self, BurnManager};
-use std::string;
 use std::type_name::{Self, TypeName};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
@@ -44,12 +43,17 @@ const ETvlBelowTarget: u64 = 3;
 public struct MigratedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     cetus_pool_id: ID,
+    /// Gross amounts withdrawn from the curve (before the migration fee).
     base_amount: u64,
     quote_amount: u64,
     sqrt_price_x64: u128,
     base_is_coin_a: bool,
     tick_spacing: u32,
-    base_dust_burned: u64,
+    /// Migration fee on the raised quote, sent to the treasury.
+    migration_fee: u64,
+    /// Base not absorbed by the CLMM seed (the fee's mirror share plus
+    /// rounding dust), burned.
+    base_burned: u64,
     quote_dust_to_platform: u64,
 }
 
@@ -115,16 +119,34 @@ fun migrate_core<Base, Quote>(
 
     // Aborts unless the curve is COMPLETED, so migration cannot run
     // twice or early; everything below is atomic with it.
-    let (base, quote) = pool::withdraw_for_migration(pool);
+    let (mut base, mut quote) = pool::withdraw_for_migration(pool);
     let base_amount = base.value();
     let quote_amount = quote.value();
     let tick_spacing = pool.tick_spacing();
     let (tick_lower, tick_upper) = pool_creator::full_range_tick_range(tick_spacing);
 
+    // Migration fee: skimmed from the raised quote before seeding, with
+    // the base leg shrunk by the same ratio (the excess is burned
+    // below). The seed price is computed from the GROSS amounts, i.e.
+    // the curve's final price, so graduation stays gap-free. The CLMM
+    // deposit keeps fixing the (shrunk) base side: the quote it then
+    // requires is at most `quote_net` because the sqrt price is floored
+    // — the same argument that made the pre-fee seeding safe.
+    let migration_fee = curve::fee_amount(quote_amount, pool.migration_fee_bps());
+    if (migration_fee > 0) {
+        sui::balance::send_funds(quote.split(migration_fee), cfg.treasury());
+    };
+    let quote_net = quote_amount - migration_fee;
+    let base_seed =
+        ((base_amount as u128) * (quote_net as u128) / (quote_amount as u128)) as u64;
+    let base_excess = base.split(base_amount - base_seed);
+
     // The pool key was reserved at launch (permission pair + creation
     // cap held by the pool), so this cannot be front-run or blocked by a
     // third party creating the pool first.
     let base_is_coin_a = factory::is_right_order<Base, Quote>();
+    // The base coin's icon becomes the Position NFT image.
+    let position_url = coin_registry::icon_url(currency);
     let (position, sqrt_price, base_left, quote_left) = if (base_is_coin_a) {
         // A = Base, B = Quote; price = quote per base.
         let sqrt_price = curve::initial_sqrt_price_x64(base_amount, quote_amount);
@@ -135,12 +157,12 @@ fun migrate_core<Base, Quote>(
                 pool::borrow_creation_cap(pool),
                 tick_spacing,
                 sqrt_price,
-                string::utf8(b""),
+                position_url,
                 tick_lower,
                 tick_upper,
                 base.into_coin(ctx),
                 quote.into_coin(ctx),
-                true, // fix the base side
+                true, // fix the (shrunk) base side
                 clock,
                 ctx,
             );
@@ -155,22 +177,25 @@ fun migrate_core<Base, Quote>(
                 pool::borrow_creation_cap(pool),
                 tick_spacing,
                 sqrt_price,
-                string::utf8(b""),
+                position_url,
                 tick_lower,
                 tick_upper,
                 quote.into_coin(ctx),
                 base.into_coin(ctx),
-                false, // still fix the base side (coin B here)
+                false, // still fix the (shrunk) base side (coin B here)
                 clock,
                 ctx,
             );
         (position, sqrt_price, base_left, quote_left)
     };
 
-    // Dust: leftover base is burned through the Currency, leftover quote
-    // accrues to the platform's fee bucket.
-    let base_dust_burned = base_left.value();
-    burn_or_destroy(currency, base_left);
+    // The fee's mirror share of base plus any rounding dust is burned
+    // through the Currency; leftover quote accrues to the platform's
+    // fee bucket.
+    let mut base_burn = base_excess;
+    base_burn.join(base_left.into_balance());
+    let base_burned = base_burn.value();
+    burn_or_destroy(currency, base_burn.into_coin(ctx));
     let quote_dust_to_platform = quote_left.value();
     pool::accrue_platform_quote(pool, quote_left.into_balance());
 
@@ -185,7 +210,8 @@ fun migrate_core<Base, Quote>(
         sqrt_price_x64: sqrt_price,
         base_is_coin_a,
         tick_spacing,
-        base_dust_burned,
+        migration_fee,
+        base_burned,
         quote_dust_to_platform,
     });
 
@@ -474,6 +500,14 @@ fun burn_or_destroy<Base>(currency: &mut Currency<Base>, coin: Coin<Base>) {
 }
 
 // === Test helpers ===
+
+#[test_only]
+/// Returns `(quote_amount, migration_fee, base_burned, sqrt_price_x64)`.
+public fun migrated_event_amounts<Base, Quote>(
+    ev: &MigratedEvent<Base, Quote>,
+): (u64, u64, u64, u128) {
+    (ev.quote_amount, ev.migration_fee, ev.base_burned, ev.sqrt_price_x64)
+}
 
 /// Runs the full migration except the lp_burn step (its interface stub
 /// aborts locally) and hands the raw Position back to the test.

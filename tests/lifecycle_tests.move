@@ -16,6 +16,7 @@ use bondingcurvesui::zzz_base::ZZZ_BASE;
 const ADMIN: address = @0xAD;
 const CREATOR: address = @0xC0FFEE;
 const TRADER: address = @0x7EADE7;
+const NEW_CREATOR: address = @0xBEEF;
 
 const I: u64 = 800_000_000_000_000; // matches config defaults (800M @ 6 dec)
 const R: u64 = 200_000_000_000_000; // 200M @ 6 dec
@@ -706,6 +707,222 @@ fun creator_can_update_project_info() {
         assert!(telegram == b"https://t.me/meme".to_string());
         assert!(website == b"https://meme.xyz".to_string());
         ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+// === Creator role transfer (two-step) ===
+
+/// Nominate as CREATOR, accept as NEW_CREATOR.
+fun transfer_creator_role(scenario: &mut Scenario) {
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        assert!(pool.pending_creator() == option::some(NEW_CREATOR));
+        assert!(pool.creator() == CREATOR); // unchanged until accepted
+        ts::return_shared(pool);
+    };
+    scenario.next_tx(NEW_CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::accept_creator(&mut pool, scenario.ctx());
+        assert!(pool.creator() == NEW_CREATOR);
+        assert!(pool.pending_creator().is_none());
+        ts::return_shared(pool);
+    };
+}
+
+#[test]
+fun creator_can_transfer_role() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    transfer_creator_role(&mut scenario);
+    // The settings rights follow the role.
+    scenario.next_tx(NEW_CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::update_project_info(
+            &mut pool,
+            b"under new management".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            scenario.ctx(),
+        );
+        let (description, _, _, _) = pool.project_info();
+        assert!(description == b"under new management".to_string());
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test]
+fun creator_keeps_rights_while_nomination_pending() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        // Still the creator: settings rights keep working.
+        pool::update_project_info(
+            &mut pool,
+            b"still mine".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            scenario.ctx(),
+        );
+        let (description, _, _, _) = pool.project_info();
+        assert!(description == b"still mine".to_string());
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ENotCreator)]
+fun nominee_has_no_rights_while_pending() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        ts::return_shared(pool);
+    };
+    scenario.next_tx(NEW_CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        // Nominated but not yet accepted: no settings rights.
+        pool::update_project_info(
+            &mut pool,
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            scenario.ctx(),
+        );
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ENotCreator)]
+fun old_creator_loses_rights_after_transfer() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    transfer_creator_role(&mut scenario);
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        // The old creator can no longer act on the pool.
+        pool::update_project_info(
+            &mut pool,
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            scenario.ctx(),
+        );
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ENotCreator)]
+fun non_creator_cannot_nominate() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    scenario.next_tx(TRADER);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, TRADER, scenario.ctx());
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ENotPendingCreator)]
+fun accept_requires_matching_nomination() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        ts::return_shared(pool);
+    };
+    scenario.next_tx(TRADER); // not the nominee
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::accept_creator(&mut pool, scenario.ctx());
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ENotPendingCreator)]
+fun cancelled_nomination_cannot_be_accepted() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        pool::cancel_creator_nomination(&mut pool, scenario.ctx());
+        assert!(pool.pending_creator().is_none());
+        ts::return_shared(pool);
+    };
+    scenario.next_tx(NEW_CREATOR);
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::accept_creator(&mut pool, scenario.ctx());
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test]
+fun tranche_unlock_pays_new_creator_after_transfer() {
+    let (mut scenario, mut clock) = setup();
+    clock.set_for_testing(1_000);
+    let currency = create_test_token(
+        &mut scenario,
+        &clock,
+        vector[100_000_000],
+        vector[pool::lock_kind_time()],
+        vector[1_000 + MIN_LOCK_MS],
+        100_000_000,
+    );
+    transfer_creator_role(&mut scenario);
+    clock.set_for_testing(1_000 + MIN_LOCK_MS);
+    scenario.next_tx(TRADER); // permissionless crank
+    {
+        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        ts::return_shared(pool);
+        // A tranche locked before the transfer pays the new creator.
+        let events = sui::event::events_by_type<
+            pool::TrancheUnlockedEvent<ZZZ_BASE, MOCK_QUOTE>,
+        >();
+        assert!(events.length() == 1);
+        let (amount, recipient) = pool::tranche_unlocked_event_amount(&events[0]);
+        assert!(amount > 0 && recipient == NEW_CREATOR);
     };
     end(scenario, clock, currency);
 }
