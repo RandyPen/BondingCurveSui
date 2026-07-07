@@ -78,7 +78,7 @@ pool::create_token<Base, Quote>(
 ): Coin<Quote>                             // change
 ```
 
-Tranche rules (aborts otherwise): the three vectors must be equal length; time locks need `unlock_ts >= now + min_lock_duration_ms` (config, default 1h); market-cap targets need `>= QuoteParams.min_tvl_target`; each tranche's gross must be `>= min_buy_amount`; tranches execute as normal curve buys (1% fee applies) and may even drain the whole curve.
+Tranche rules (aborts otherwise): the three vectors must be equal length; time locks need `unlock_ts >= now + min_lock_duration_ms` (config, default 1h); market-cap targets need `>= QuoteParams.min_tvl_target` and `>= tvl_target_multiplier (default 3) x graduation market cap` (graduation mcap = (I+R)/R x threshold = 5 x threshold with default supply split); each tranche's gross must be `>= min_buy_amount`; tranches execute as normal curve buys (1% fee applies) and may even drain the whole curve.
 
 ```ts
 const tx = new Transaction();

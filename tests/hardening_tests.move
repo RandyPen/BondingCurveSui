@@ -287,7 +287,7 @@ module bondingcurvesui::hardening_tests {
             let mut cfg = scenario.take_shared<LaunchpadConfig>();
             // initial/remain ratio of 2000 exceeds the 1000 cap.
             config::set_launch_params(
-                &admin_cap, &mut cfg, 6, 2_000_000_000, 1_000_000, 200, 0,
+                &admin_cap, &mut cfg, 6, 2_000_000_000, 1_000_000, 200, 0, 3,
             );
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
@@ -423,7 +423,7 @@ module bondingcurvesui::hardening_tests {
         {
             let admin_cap = scenario.take_from_sender<AdminCap>();
             let mut cfg = scenario.take_shared<LaunchpadConfig>();
-            config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0);
+            config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0, 3);
             scenario.return_to_sender(admin_cap);
             ts::return_shared(cfg);
         };

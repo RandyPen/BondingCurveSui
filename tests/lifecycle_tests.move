@@ -16,8 +16,8 @@ module bondingcurvesui::lifecycle_tests {
     const CREATOR: address = @0xC0FFEE;
     const TRADER: address = @0x7EADE7;
 
-    const I: u64 = 8_000_000_000_000; // matches config defaults
-    const R: u64 = 2_000_000_000_000;
+    const I: u64 = 800_000_000_000_000; // matches config defaults (800M @ 6 dec)
+    const R: u64 = 200_000_000_000_000; // 200M @ 6 dec
     const THRESHOLD: u64 = 3_000_000_000;
     const MIN_THRESHOLD: u64 = 1_000_000_000;
     const CREATION_FEE: u64 = 10_000_000;

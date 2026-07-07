@@ -344,7 +344,15 @@ module bondingcurvesui::pool {
             tick_spacing: pool.tick_spacing,
         });
 
-        // Creator first-buy tranches.
+        // Creator first-buy tranches. A market-cap target below
+        // multiplier x graduation market cap would unlock (almost)
+        // immediately after migration; graduation market cap is
+        // (I + R) * threshold / R in quote units.
+        let min_mcap_target =
+            (cfg.tvl_target_multiplier() as u128)
+                * ((initial_base + remain_base) as u128)
+                * (threshold as u128)
+                / (remain_base as u128);
         execute_tranche_buys(
             &mut pool,
             tranche_quote_in,
@@ -353,6 +361,7 @@ module bondingcurvesui::pool {
             &mut payment,
             cfg.min_lock_duration_ms(),
             quote_params.quote_min_tvl_target(),
+            min_mcap_target,
             clock,
         );
 
@@ -403,6 +412,7 @@ module bondingcurvesui::pool {
         payment: &mut Coin<Quote>,
         min_lock_duration_ms: u64,
         min_tvl_target: u64,
+        min_mcap_target: u128,
         clock: &Clock,
     ) {
         let count = quote_in.length();
@@ -420,6 +430,7 @@ module bondingcurvesui::pool {
                 assert!(param >= clock.timestamp_ms() + min_lock_duration_ms, EInvalidLockParam);
             } else if (kind == LOCK_KIND_TVL) {
                 assert!(param >= min_tvl_target && param > 0, EInvalidLockParam);
+                assert!((param as u128) >= min_mcap_target, EInvalidLockParam);
             } else {
                 abort EInvalidLockKind
             };

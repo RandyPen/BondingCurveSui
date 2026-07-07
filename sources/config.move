@@ -88,6 +88,10 @@ module bondingcurvesui::config {
         /// Minimum duration of a time-locked creator tranche; prevents
         /// nominal-only locks.
         min_lock_duration_ms: u64,
+        /// A market-cap tranche target must be at least this multiple of the
+        /// launch's graduation market cap, or it would unlock immediately
+        /// after migration.
+        tvl_target_multiplier: u64,
         /// Quote-coin whitelist.
         quotes: Table<TypeName, QuoteParams>,
         /// Base coin type -> pool object ID; enforces one launch per base.
@@ -118,6 +122,7 @@ module bondingcurvesui::config {
         remain_base: u64,
         tick_spacing: u32,
         min_lock_duration_ms: u64,
+        tvl_target_multiplier: u64,
     }
 
     public struct TreasuryUpdatedEvent has copy, drop {
@@ -143,13 +148,14 @@ module bondingcurvesui::config {
             paused: false,
             treasury: ctx.sender(),
             base_decimals: 6,
-            initial_virtual_base: 8_000_000_000_000, // 8M with 6 decimals
-            remain_base: 2_000_000_000_000, // 2M with 6 decimals
+            initial_virtual_base: 800_000_000_000_000, // 800M with 6 decimals
+            remain_base: 200_000_000_000_000, // 200M with 6 decimals
             curve_fee_bps: 100, // 1%
             curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
             lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
             tick_spacing: 200, // Cetus 1% fee tier
             min_lock_duration_ms: 60 * 60 * 1000, // 1 hour
+            tvl_target_multiplier: 3,
             quotes: table::new(ctx),
             pools: table::new(ctx),
         });
@@ -248,9 +254,11 @@ module bondingcurvesui::config {
         remain_base: u64,
         tick_spacing: u32,
         min_lock_duration_ms: u64,
+        tvl_target_multiplier: u64,
     ) {
         cfg.assert_version();
         assert!(remain_base > 0 && initial_virtual_base > remain_base, EInvalidLaunchParams);
+        assert!(tvl_target_multiplier > 0, EInvalidLaunchParams);
         // Keep the curve/migration inside Cetus's price envelope: an extreme
         // initial/remain ratio can push the CLMM seed sqrt price out of the
         // representable range and permanently block migration.
@@ -263,12 +271,14 @@ module bondingcurvesui::config {
         cfg.remain_base = remain_base;
         cfg.tick_spacing = tick_spacing;
         cfg.min_lock_duration_ms = min_lock_duration_ms;
+        cfg.tvl_target_multiplier = tvl_target_multiplier;
         event::emit(LaunchParamsUpdatedEvent {
             base_decimals,
             initial_virtual_base,
             remain_base,
             tick_spacing,
             min_lock_duration_ms,
+            tvl_target_multiplier,
         });
     }
 
@@ -346,6 +356,8 @@ module bondingcurvesui::config {
     public fun tick_spacing(cfg: &LaunchpadConfig): u32 { cfg.tick_spacing }
 
     public fun min_lock_duration_ms(cfg: &LaunchpadConfig): u64 { cfg.min_lock_duration_ms }
+
+    public fun tvl_target_multiplier(cfg: &LaunchpadConfig): u64 { cfg.tvl_target_multiplier }
 
     public fun is_paused(cfg: &LaunchpadConfig): bool { cfg.paused }
 

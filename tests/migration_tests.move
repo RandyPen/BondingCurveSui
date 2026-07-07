@@ -19,18 +19,19 @@ module bondingcurvesui::migration_tests {
     const CREATOR: address = @0xC0FFEE;
     const TRADER: address = @0x7EADE7;
 
-    const R: u64 = 2_000_000_000_000;
+    const R: u64 = 200_000_000_000_000; // 200M @ 6 dec, matches config defaults
     const THRESHOLD: u64 = 3_000_000_000;
     const MIN_THRESHOLD: u64 = 1_000_000_000;
     const CREATION_FEE: u64 = 10_000_000;
     const MIN_BUY: u64 = 1_000;
     const MIN_TVL_TARGET: u64 = 1_000;
 
-    // The unlock condition is market cap: circulating supply (I + R = 10M
-    // tokens) x CLMM price (THRESHOLD / R at graduation), i.e. about
-    // 5 * THRESHOLD = 15e9 right after migration.
-    const REACHABLE_TVL_TARGET: u64 = 5_000_000_000;
-    const UNREACHABLE_TVL_TARGET: u64 = 20_000_000_000;
+    // Market cap right after migration is 5 * THRESHOLD = 15e9 (circulating
+    // supply x graduation price, invariant in supply scale). Targets must be
+    // at least tvl_target_multiplier (3) x that, i.e. 45e9; reaching one
+    // requires the Cetus price to actually rise post-migration.
+    const REACHABLE_TVL_TARGET: u64 = 45_000_000_000; // exactly the minimum
+    const UNREACHABLE_TVL_TARGET: u64 = 100_000_000_000;
 
     // === Helpers (generic over the base coin to cover both orderings) ===
 
@@ -159,6 +160,69 @@ module bondingcurvesui::migration_tests {
         mocks::destroy_cetus_env(cetus_env);
         unit_test::destroy(currency);
         scenario.end();
+    }
+
+
+    /// Pumps the Cetus pool price so the market cap roughly triples
+    /// (sqrt price x1.8 => price x3.24): buys base with freshly minted quote
+    /// through a flash swap. Straight orientation (base is coin A).
+    fun pump_price_straight(scenario: &mut Scenario, clock: &Clock, cetus_env: &mut mocks::CetusEnv) {
+        scenario.next_tx(TRADER);
+        let mut cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
+        let (cetus_config, _) = cetus_env.cetus_refs();
+        let sp0 = cetus_clmm::pool::current_sqrt_price(&cetus_pool);
+        let limit = sp0 / 5 * 9; // x1.8
+        let (base_out, quote_out, receipt) = cetus_clmm::pool::flash_swap<ZZZ_BASE, MOCK_QUOTE>(
+            cetus_config,
+            &mut cetus_pool,
+            false, // quote (B) in, base (A) out: price rises
+            true,
+            1_000_000_000_000_000,
+            limit,
+            clock,
+        );
+        let owed = cetus_clmm::pool::swap_pay_amount(&receipt);
+        cetus_clmm::pool::repay_flash_swap<ZZZ_BASE, MOCK_QUOTE>(
+            cetus_config,
+            &mut cetus_pool,
+            sui::balance::zero<ZZZ_BASE>(),
+            sui::coin::mint_for_testing<MOCK_QUOTE>(owed, scenario.ctx()).into_balance(),
+            receipt,
+        );
+        transfer::public_transfer(base_out.into_coin(scenario.ctx()), TRADER);
+        quote_out.destroy_zero();
+        ts::return_shared(cetus_pool);
+    }
+
+    /// Same pump for the inverted orientation (base is coin B): buying base
+    /// with quote pushes the pool price (B per A) DOWN, which raises the
+    /// base price.
+    fun pump_price_inverted(scenario: &mut Scenario, clock: &Clock, cetus_env: &mut mocks::CetusEnv) {
+        scenario.next_tx(TRADER);
+        let mut cetus_pool = scenario.take_shared<CetusPool<MOCK_QUOTE, AAA_BASE>>();
+        let (cetus_config, _) = cetus_env.cetus_refs();
+        let sp0 = cetus_clmm::pool::current_sqrt_price(&cetus_pool);
+        let limit = sp0 / 9 * 5; // sqrt /1.8
+        let (quote_out, base_out, receipt) = cetus_clmm::pool::flash_swap<MOCK_QUOTE, AAA_BASE>(
+            cetus_config,
+            &mut cetus_pool,
+            true, // quote (A) in, base (B) out: pool price falls, base price rises
+            true,
+            1_000_000_000_000_000,
+            limit,
+            clock,
+        );
+        let owed = cetus_clmm::pool::swap_pay_amount(&receipt);
+        cetus_clmm::pool::repay_flash_swap<MOCK_QUOTE, AAA_BASE>(
+            cetus_config,
+            &mut cetus_pool,
+            sui::coin::mint_for_testing<MOCK_QUOTE>(owed, scenario.ctx()).into_balance(),
+            sui::balance::zero<AAA_BASE>(),
+            receipt,
+        );
+        transfer::public_transfer(base_out.into_coin(scenario.ctx()), TRADER);
+        quote_out.destroy_zero();
+        ts::return_shared(cetus_pool);
     }
 
     // === Migration ===
@@ -298,6 +362,9 @@ module bondingcurvesui::migration_tests {
             option::some(REACHABLE_TVL_TARGET),
         );
         migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+        // Right after migration the market cap (15e9) is below the target
+        // (45e9); the price must actually rise ~3x first.
+        pump_price_straight(&mut scenario, &clock, &mut cetus_env);
 
         scenario.next_tx(TRADER); // permissionless trigger
         {
@@ -326,6 +393,7 @@ module bondingcurvesui::migration_tests {
             option::some(REACHABLE_TVL_TARGET),
         );
         migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+        pump_price_inverted(&mut scenario, &clock, &mut cetus_env);
 
         scenario.next_tx(TRADER);
         {

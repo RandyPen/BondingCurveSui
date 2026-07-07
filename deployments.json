@@ -9,14 +9,30 @@
     "lpBurnManager": "0x1d94aa32518d0cb00f9de6ed60d450c9a2090761f326752ffad06b2e9404f845",
     "cetusRewarderVault": "0xce7bceef26d3ad1f6d9b6f13a953f053e6ed3ca77907516481ce99ae8e588f2b",
     "quotes": {
-      "_comment": "Cetus allowed_pair_config confirmed for SUI and USDC at tick_spacing 200 (1% fee tier).",
+      "_comment": "Cetus allowed_pair_config confirmed for SUI and USDC at tick_spacing 200 (1% fee tier). Thresholds sized for ~$25k graduation market cap (= 5 x threshold) at SUI ~= 0.7 USDC (2026-07-07), deliberately low for the current thin Sui meme volume; all values adjustable later via update_quote / set_launch_params (AdminCap), affecting new launches only.",
       "SUI": {
         "type": "0x2::sui::SUI",
-        "cetusAllowedTickSpacing": 200
+        "cetusAllowedTickSpacing": 200,
+        "decimals": 9,
+        "defaultThreshold": "7000000000000",
+        "_defaultThresholdHuman": "7,000 SUI (~$4.9k raised; graduation mcap ~$24.5k)",
+        "minThreshold": "2500000000000",
+        "creationFee": "1000000000",
+        "minBuyAmount": "10000000",
+        "minTvlTarget": "105000000000000",
+        "_minTvlTargetHuman": "105,000 SUI; on-chain rule additionally enforces >= tvl_target_multiplier (default 3) x the launch's graduation mcap"
       },
       "USDC": {
         "type": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
-        "cetusAllowedTickSpacing": 200
+        "cetusAllowedTickSpacing": 200,
+        "decimals": 6,
+        "defaultThreshold": "5000000000",
+        "_defaultThresholdHuman": "5,000 USDC (graduation mcap $25k)",
+        "minThreshold": "2000000000",
+        "creationFee": "1000000",
+        "minBuyAmount": "10000",
+        "minTvlTarget": "75000000000",
+        "_minTvlTargetHuman": "75,000 USDC; on-chain rule additionally enforces >= tvl_target_multiplier (default 3) x the launch's graduation mcap"
       }
     },
     "_cetusSource": "Cetus shared-object ids from the official cetus-skills repo (skills/cetus-clmm, CetusProtocol/cetus-skills); re-verify on-chain before first mainnet tx. lpBurnManager/cetusRewarderVault are not covered by that skill: take them from the cetus-clmm-interface lp_burn README / Cetus docs at deploy time.",
@@ -43,6 +59,8 @@
     "phaseTrading": 0,
     "phaseCompleted": 1,
     "phaseMigrated": 2,
-    "phaseHalted": 3
+    "phaseHalted": 3,
+    "totalSupply": "1_000_000_000 tokens @6dec: 800M curve (8e14) + 200M CLMM LP (2e14)",
+    "tvlTargetMultiplierDefault": 3
   }
 }
