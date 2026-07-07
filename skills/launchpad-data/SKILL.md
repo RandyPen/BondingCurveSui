@@ -50,7 +50,8 @@ const obj = await client.getObject({ id: poolId, options: { showContent: true } 
 // virtual_base, virtual_quote, virtual_base_floor, threshold,
 // base_reserve, lp_base_reserve, quote_reserve (progress bar = quote_reserve / threshold),
 // platform_fees, creator_fees, curve_fee_bps, tranches[], creator,
-// cetus_pool_id / base_is_coin_a / completed_at_ms (post-completion)
+// cetus_pool_id / base_is_coin_a (post-migration),
+// completed_at_ms (clock ms when the curve completed; informational)
 ```
 
 Rule of thumb: **history = events, current state = object read.** Don't reconstruct progress bars from event folds when one `getObject` gives it.

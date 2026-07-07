@@ -119,8 +119,31 @@ What tx3 does besides minting: reserves the Cetus pool key (permission pair — 
 ## After launch (agent lifecycle)
 
 - Trade: `launchpad-trade` skill. Watch your pool via `TradedEvent<Base, Quote>` (`launchpad-data` skill).
+- Creator-only maintenance (both check `ctx.sender() == pool.creator`):
+  - `pool::update_project_info(pool, description, twitter, telegram, website)` — full replace of the pool's project info; emits `ProjectInfoUpdatedEvent<Base, Quote>`.
+  - `pool::update_base_metadata(pool, currency, name?, description?, icon_url?)` — updates the coin's Currency metadata through the pool-held MetadataCap (symbol immutable; pass none to leave a field unchanged).
 - On drain: attach `migration::migrate` to the completing buy, or crank it separately (`launchpad-keeper` skill).
 - Unlock tranches: time — `pool::unlock_tranche_time(pool, index, clock)` (permissionless, pays the creator); market-cap — `migration::unlock_tranche_tvl{,_inverted}(pool, cetus_pool, currency, index)` (private `entry`; call as a direct PTB command; requires MIGRATED and circulating-supply × price ≥ target; `Pool.base_is_coin_a` decides which variant).
+
+## Platform-assisted single-signature launch (recommended UX)
+
+The three transactions are a framework constraint (one module per coin +
+coin_registry's share-then-mutate timing), but only tx3 must be signed by the
+creator:
+
+1. Platform backend publishes the coin package from the bytecode template
+   (tx1) and immediately runs the permissionless `migrate_legacy_metadata`
+   (tx2), then transfers the zero-supply `TreasuryCap` to the creator.
+2. The creator signs a single transaction: `create_token` with their
+   tranches and project info. Creator attribution is automatic
+   (`pool.creator = sender`, and only the sender's TreasuryCap works).
+
+The inter-transaction gaps are safe: tx2 is permissionless (anyone doing it
+first is helping), metadata/premint tampering needs the TreasuryCap the
+creator holds, and the Cetus pool cannot be front-run before tx3 (no base
+supply exists). Best practice when the platform publishes: make the coin
+package immutable (or burn the UpgradeCap) — upgrades cannot mint (the OTW
+is consumed and the cap destroyed at launch), but immutability is cleaner.
 
 ## Abort quick reference (module `pool` unless noted)
 
@@ -133,6 +156,7 @@ What tx3 does besides minting: reserves the Cetus pool key (permission pair — 
 | 14 | EWrongCreationFee | fee coin not exact |
 | 15 | EInsufficientPayment | payment < sum of tranche gross |
 | 23 | ERegulatedBase | regulated coin |
+| 25 | EProjectInfoTooLong | description > 1000 or a link > 500 chars |
 | config 4 | EQuoteNotListed | quote not whitelisted/disabled |
 | config 7 | EBaseAlreadyLaunched | base type reused |
 | config 8 | EThresholdTooLow | custom threshold < per-quote min |
