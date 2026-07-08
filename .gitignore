@@ -16,4 +16,5 @@ deployments.json
 skills/
 docs/
 scripts/
-template/
+# template/ source IS tracked (coin template = contract code); its build/ and
+# Move.lock/Move.toml are covered by the rules above.
