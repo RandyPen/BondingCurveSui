@@ -1,5 +1,19 @@
-build/*
+# Build output (any package, any depth)
+build/
 traces/*
 .trace
 .coverage*
 Pub.*.toml
+
+# Move package config — regenerated per machine, not tracked
+Move.lock
+Move.toml
+
+# Deployment records — environment-specific, updated locally only
+deployments.json
+
+# Developer tooling / docs / generated assets — local only, not part of contract code
+skills/
+docs/
+scripts/
+template/
