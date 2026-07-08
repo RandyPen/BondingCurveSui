@@ -1,0 +1,16 @@
+[package]
+name = "bondingcurvesui_specs"
+edition = "2024"
+
+# Formal-verification package for the Sui Prover (`sui-prover --path specs`).
+#
+# `sources/curve.move` is a relative symlink to `../sources/curve.move`, so
+# the prover verifies the exact same file the main package publishes. The
+# curve module depends only on the standard library, which lets this package
+# avoid the CetusClmm/LpBurn dependency tree — the prover's compilation
+# pipeline cannot process those external packages, and the prover injects
+# its own implicit MoveStdlib/Sui dependencies (per sui-prover docs, no
+# explicit Sui dependency may be declared here).
+
+[addresses]
+bondingcurvesui = "0x0"

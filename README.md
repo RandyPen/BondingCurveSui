@@ -62,8 +62,13 @@ To auto-load them as Claude Code project skills, symlink or copy the directories
 
 ```bash
 sui move build
-sui move test   # 72 tests
+sui move test   # 86 tests
 ```
+
+The curve math (`sources/curve.move`) is additionally formally verified with
+the Sui Prover — constant-product invariant preservation, reserve
+conservation/solvency, exact fee/`isqrt` semantics, and a no-profit
+round-trip theorem. See `specs/README.md`; run with `specs/prove.sh`.
 
 Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR resolves on mainnet (cetus-contracts @ clmm-v14 — real sources, so unit tests create real CLMM pools); the lp_burn interface is vendored locally (`vendor/lp_burn`) to drop its clmm_vester transitive dependency, whose MVR resolution fails outside mainnet.
 

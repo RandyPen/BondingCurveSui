@@ -35,6 +35,9 @@ const EZeroAmount: u64 = 6;
 
 const BPS_DENOMINATOR: u64 = 10_000;
 const U64_MAX: u128 = 0xffff_ffff_ffff_ffff;
+/// 2^128, the Q64.64 ratio scale. A literal (not `1 << 128`) because the
+/// prover cannot reason about shifts of symbolic u256 values.
+const Q128: u256 = 0x1_0000_0000_0000_0000_0000_0000_0000_0000;
 
 // === Reserve derivation ===
 
@@ -114,7 +117,10 @@ public fun fee_amount(amount: u64, bps: u64): u64 {
 /// coin A and `amount_b` of coin B: `sqrt(amount_b / amount_a) * 2^64`.
 public fun initial_sqrt_price_x64(amount_a: u64, amount_b: u64): u128 {
     assert!(amount_a > 0 && amount_b > 0, EZeroAmount);
-    let ratio_x128 = ((amount_b as u256) << 128) / (amount_a as u256);
+    // `* Q128` rather than `<< 128`: identical for any u64 amount (no
+    // truncation or overflow below 2^192), and multiplication is precisely
+    // modeled by the prover while symbolic u256 shifts are not.
+    let ratio_x128 = (amount_b as u256) * Q128 / (amount_a as u256);
     (isqrt(ratio_x128) as u128)
 }
 
@@ -149,15 +155,13 @@ public fun tvl_in_quote(
 /// Floored integer square root.
 public fun isqrt(x: u256): u256 {
     if (x == 0) return 0;
-    // Initial guess: a power of two >= sqrt(x), found by halving the bit
-    // length; Newton iterations then converge monotonically downward.
-    let mut bit = 0u16;
-    let mut probe = x;
-    while (probe > 0) {
-        probe = probe >> 1;
-        bit = bit + 1;
-    };
-    let mut guess = 1u256 << (((bit + 1) / 2) as u8);
+    // 2^128 is an upper bracket of sqrt(x) for every u256 input; Newton
+    // iterations converge monotonically downward from it. The constant
+    // start costs a few dozen extra halving steps for small inputs
+    // (irrelevant: called once per migration) and keeps the function
+    // formally verifiable — a bit-length prescan reintroduces variable
+    // power-of-two reasoning the prover cannot discharge.
+    let mut guess = 1u256 << 128;
     loop {
         let next = (guess + x / guess) >> 1;
         if (next >= guess) return guess;
