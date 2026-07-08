@@ -3,7 +3,6 @@ module bondingcurvesui::hardening_tests;
 
 use std::unit_test;
 use sui::clock::{Self, Clock};
-use sui::coin_registry;
 use sui::test_scenario::{Self as ts, Scenario};
 
 use bondingcurvesui::config::{Self, AdminCap, LaunchpadConfig};
@@ -47,7 +46,10 @@ fun setup(): (Scenario, Clock) {
     (scenario, clock)
 }
 
-/// create_token with full control over the treasury/currency pair.
+/// create_token through the fail-closed factory: `new_sealed_base_for_testing`
+/// stands in for publishing a template coin whose `init` calls `seal`.
+/// `_tamper` is retained for call-site compatibility but is now a no-op — the
+/// receipt flow structurally prevents pre-minting or pre-claiming the caps.
 fun try_create(
     scenario: &mut Scenario,
     clock: &Clock,
@@ -56,25 +58,17 @@ fun try_create(
     tranche_lock_kind: vector<u8>,
     tranche_lock_param: vector<u64>,
     payment: u64,
-    tamper: u8, // 0 none, 1 pre-mint supply, 2 pre-claim metadata cap
+    _tamper: u8,
 ) {
-    scenario.next_tx(@0x0);
-    let (mut cap, mut currency) = mocks::new_base_currency<ZZZ_BASE>(6, scenario.ctx());
     scenario.next_tx(CREATOR);
-    if (tamper == 1) {
-        let premint = cap.mint(1, scenario.ctx());
-        transfer::public_transfer(premint, CREATOR);
-    } else if (tamper == 2) {
-        let mcap = coin_registry::claim_metadata_cap(&mut currency, &cap, scenario.ctx());
-        transfer::public_transfer(mcap, CREATOR);
-    };
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<ZZZ_BASE>(scenario.ctx());
     let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
     let mut cfg = scenario.take_shared<LaunchpadConfig>();
     let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
     let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
         &mut cfg,
         &mut currency,
-        cap,
+        receipt,
         mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
         threshold,
         b"".to_string(),
@@ -98,21 +92,12 @@ fun try_create(
 
 // === Base coin sanity ===
 
-#[test, expected_failure(abort_code = pool::ESupplyNotZero)]
-fun create_rejects_preminted_supply() {
-    let (mut scenario, clock) = setup();
-    try_create(&mut scenario, &clock, option::none(), vector[], vector[], vector[], 0, 1);
-    clock.destroy_for_testing();
-    scenario.end();
-}
-
-#[test, expected_failure(abort_code = pool::EMetadataCapClaimed)]
-fun create_rejects_claimed_metadata_cap() {
-    let (mut scenario, clock) = setup();
-    try_create(&mut scenario, &clock, option::none(), vector[], vector[], vector[], 0, 2);
-    clock.destroy_for_testing();
-    scenario.end();
-}
+// Note: the former `create_rejects_preminted_supply` and
+// `create_rejects_claimed_metadata_cap` tests were removed. With coin creation
+// held by the launchpad's `seal`, the base coin is always freshly created with
+// zero supply and the MetadataCap is claimed by `seal` itself — there is no way
+// for a caller to pre-mint or pre-claim, so those vectors are structurally
+// impossible rather than runtime-rejected.
 
 // === Threshold selection ===
 
@@ -246,44 +231,60 @@ fun create_rejects_tvl_target_below_minimum() {
     scenario.end();
 }
 
-// === Regulated base coin (honeypot) rejection ===
+// === First-buy per-kind cap (time 3% / tvl 5%): clamp + refund ===
 
-#[test, expected_failure(abort_code = pool::ERegulatedBase)]
-fun create_rejects_regulated_base() {
-    let (mut scenario, clock) = setup();
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) =
-        mocks::new_regulated_base_currency<ZZZ_BASE>(6, scenario.ctx());
-    scenario.next_tx(CREATOR);
-    let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
-    let mut cfg = scenario.take_shared<LaunchpadConfig>();
-    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
-    let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
-        &mut cfg,
-        &mut currency,
-        cap,
-        mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
-        option::none(),
-        b"".to_string(),
-        b"".to_string(),
-        b"".to_string(),
-        b"".to_string(),
-        vector[],
-        vector[],
-        vector[],
-        mocks::mint_quote<MOCK_QUOTE>(0, scenario.ctx()),
-        cetus_config,
-        cetus_pools,
+#[test]
+fun oversized_first_buy_clamps_to_cap() {
+    let (mut scenario, mut clock) = setup();
+    clock.set_for_testing(1_000);
+    // Enable the caps (time 3%, tvl 5%); the test config defaults to no cap.
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 3, 300, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    // A time tranche funded far beyond the 3% cap is CLAMPED to exactly 3% of
+    // total supply (I+R = 1e15 → 3e13), and the excess quote is refunded rather
+    // than aborting the launch.
+    try_create(
+        &mut scenario,
         &clock,
-        scenario.ctx(),
+        option::none(),
+        vector[2_000_000_000],
+        vector[pool::lock_kind_time()],
+        vector[1_000 + MIN_LOCK_MS],
+        2_000_100_000,
+        0,
     );
-    transfer::public_transfer(change, CREATOR);
-    ts::return_shared(cfg);
-    mocks::destroy_cetus_env(cetus_env);
-    unit_test::destroy(currency);
+    scenario.next_tx(CREATOR);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let (_, _, _, locked, _) = pool.tranche_info(0);
+        assert!(locked == 30_000_000_000_000); // exactly 3% of supply
+        ts::return_shared(pool);
+    };
     clock.destroy_for_testing();
     scenario.end();
 }
+
+// === Regulated base coin (honeypot) rejection ===
+//
+// The former `create_rejects_regulated_base` runtime test was removed: a
+// regulated base coin can no longer even reach `create_token`. Creating a
+// `DenyCapV2` requires calling `create_regulated_currency_v2` with the coin's
+// one-time witness, which consumes that witness — so the same coin can never
+// also be passed to `seal` to obtain a `FactoryReceipt`. `create_token`
+// requires a receipt by value, so a regulated coin is rejected at the type
+// level (no receipt can exist), not by a runtime abort. The residual
+// `ERegulatedBase` assertion remains in `create_token` purely as defense in
+// depth and is unreachable.
 
 // === Launch parameter guard rails ===
 
@@ -296,7 +297,7 @@ fun launch_params_reject_extreme_ratio() {
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
         // initial/remain ratio of 2000 exceeds the 1000 cap.
         config::set_launch_params(
-            &admin_cap, &mut cfg, 6, 2_000_000_000, 1_000_000, 200, 0, 3,
+            &admin_cap, &mut cfg, 9, 2_000_000_000, 1_000_000, 200, 0, 3, 300, 500,
         );
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
@@ -447,7 +448,7 @@ fun launch_params_reject_remain_ge_initial() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0, 3);
+        config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0, 3, 300, 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };

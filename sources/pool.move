@@ -37,8 +37,9 @@ const ENotCompleted: u64 = 3;
 const ESupplyNotZero: u64 = 4;
 /// Currency decimals differ from the configured base decimals.
 const EDecimalsMismatch: u64 = 5;
-/// The Currency's MetadataCap was already claimed by someone else.
-const EMetadataCapClaimed: u64 = 6;
+// Code 6 (EMetadataCapClaimed) retired: `seal` claims the MetadataCap itself
+// (via finalize) and hands it to `create_token` in the FactoryReceipt, so there
+// is no external metadata-cap-claim race to guard against.
 /// Tranche parameter vectors have different lengths.
 const ETrancheVectorMismatch: u64 = 7;
 /// More first-buy tranches than allowed.
@@ -80,11 +81,16 @@ const EProjectInfoTooLong: u64 = 25;
 const ENotPendingCreator: u64 = 26;
 /// No creator nomination is pending.
 const ENoPendingCreator: u64 = 27;
+// Code 28 (ETrancheExceedsCap) retired: an over-cap first-buy is now clamped to
+// the cap with the excess quote refunded, rather than aborting.
 
 // === Constants ===
 
 const VERSION: u64 = 1;
 const MAX_TRANCHES: u64 = 16;
+/// Sentinel passed to `buy_internal` for public buys: no first-buy cap (only
+/// the curve-completion clamp applies).
+const NO_FIRST_BUY_CAP: u64 = 0xffff_ffff_ffff_ffff;
 const MAX_DESCRIPTION_LEN: u64 = 1000;
 const MAX_LINK_LEN: u64 = 500;
 
@@ -97,10 +103,35 @@ const PHASE_MIGRATED: u8 = 2;
 const LOCK_KIND_TIME: u8 = 0;
 const LOCK_KIND_TVL: u8 = 1;
 
+/// Platform base-coin decimals, hard-coded into `seal` (never a caller/template
+/// parameter). Must equal `LaunchpadConfig.base_decimals` so `create_token`
+/// accepts sealed coins.
+const STD_BASE_DECIMALS: u8 = 9;
+
 // === Structs ===
 
 /// Dynamic-object-field key for the MetadataCap held by the pool.
 public struct MetadataCapKey has copy, drop, store {}
+
+/// Provenance proof produced by `seal` and consumed by `create_token`.
+///
+/// `seal` is the SOLE constructor: it creates the base `Currency<T>` through
+/// `coin_registry::new_currency_with_otw` (the UNREGULATED path) and never
+/// calls `make_regulated`. So holding a `FactoryReceipt<T>` proves the base
+/// coin is provably, permanently unregulated (no `DenyCapV2`, regulated state
+/// can never be `Regulated` or `Unknown`). `create_token` requires it by
+/// value, which is the fail-closed gate — a coin created any other way has no
+/// receipt and cannot open a pool. The one-time witness of `T` is consumed
+/// exactly once, so a regulated twin of `T` can never also have a receipt.
+public struct FactoryReceipt<phantom T> has key, store {
+    id: UID,
+    /// Zero-supply treasury cap; `create_token` mints the fixed supply from it,
+    /// then converts the supply to burn-only.
+    treasury: TreasuryCap<T>,
+    /// Metadata-update cap (already claimed by `seal`'s `finalize`); stored in
+    /// the pool so the creator keeps name/description/icon update rights.
+    metadata_cap: MetadataCap<T>,
+}
 
 /// Project links and description, shown on token pages. A plain pool
 /// field (not a dynamic field) so a single getObject returns it.
@@ -256,16 +287,78 @@ public struct CreatorTransferredEvent<phantom Base, phantom Quote> has copy, dro
 
 // === Token creation ===
 
+/// Creates the base coin's `Currency` on behalf of the launchpad and returns a
+/// `FactoryReceipt<T>`. Call this from the base coin module's `init`, passing
+/// the one-time witness — that is the only place a `T` OTW exists.
+///
+/// Because the launchpad (not the coin author) runs the currency constructor,
+/// and it uses the UNREGULATED `new_currency_with_otw`, the coin is provably
+/// unregulated: the OTW is consumed here, so the same `T` can never also be
+/// passed to `create_regulated_currency_v2` to obtain a `DenyCapV2`. Decimals
+/// are hard-coded to the platform standard; supply is left at zero (minted
+/// later in `create_token`). The `Currency<T>` is finalized (sent to the coin
+/// registry) and must be shared with `coin_registry::finalize_registration`
+/// before `create_token`.
+public fun seal<T: drop>(
+    otw: T,
+    symbol: String,
+    name: String,
+    description: String,
+    icon_url: String,
+    ctx: &mut TxContext,
+): FactoryReceipt<T> {
+    let (initializer, treasury) = coin_registry::new_currency_with_otw<T>(
+        otw,
+        STD_BASE_DECIMALS,
+        symbol,
+        name,
+        description,
+        icon_url,
+        ctx,
+    );
+    let metadata_cap = coin_registry::finalize(initializer, ctx);
+    FactoryReceipt { id: object::new(ctx), treasury, metadata_cap }
+}
+
+#[test_only]
+/// Mirrors `seal` for tests, but recovers the `Currency<T>` by value (via the
+/// framework's test-only finalize) instead of routing it through the registry,
+/// so tests can pass it straight to `create_token` as `&mut`. Produces the same
+/// matched, provably-unregulated `(receipt, currency)` a real launch would.
+public fun new_sealed_base_for_testing<T: drop>(
+    ctx: &mut TxContext,
+): (FactoryReceipt<T>, Currency<T>) {
+    let otw = sui::test_utils::create_one_time_witness<T>();
+    let (initializer, treasury) = coin_registry::new_currency_with_otw<T>(
+        otw,
+        STD_BASE_DECIMALS,
+        b"TST".to_string(),
+        b"Test Base".to_string(),
+        b"launchpad test base coin".to_string(),
+        // Matches mocks::base_icon_url(); migration tests assert this icon is
+        // stamped onto the Cetus position NFT.
+        b"https://example.com/base-icon.png".to_string(),
+        ctx,
+    );
+    let (currency, metadata_cap) = coin_registry::finalize_unwrap_for_testing<T>(initializer, ctx);
+    (FactoryReceipt { id: object::new(ctx), treasury, metadata_cap }, currency)
+}
+
 /// Launches a new token on the bonding curve.
 ///
-/// Preconditions (transactions 1 and 2 of the launch flow):
-/// - the base coin package is published and `treasury_cap` has zero supply;
-/// - `coin_registry::migrate_legacy_metadata` has created the shared
-///   `Currency<Base>`.
+/// Launch flow (three transactions):
+/// 1. publish the base coin package — its `init` calls `seal`, which creates
+///    the provably-unregulated `Currency<Base>` and returns a `FactoryReceipt`;
+/// 2. `coin_registry::finalize_registration` shares that `Currency<Base>`;
+/// 3. this call, passing the receipt from step 1.
 ///
-/// This function mints the fixed total supply, takes custody of the
-/// MetadataCap (the creator keeps metadata-update rights through
-/// update_base_metadata), converts the supply to burn-only (consuming
+/// Requiring `receipt: FactoryReceipt<Base>` is the fail-closed gate: only
+/// `seal` mints a receipt, and only via the unregulated constructor, so a
+/// base coin that could carry a `DenyCapV2` can never reach a pool.
+///
+/// This function mints the fixed total supply from the receipt's treasury cap,
+/// takes custody of the MetadataCap (the creator keeps metadata-update rights
+/// through update_base_metadata), converts the supply to burn-only (consuming
 /// the treasury cap), reserves the future Cetus pool key (mints a
 /// PoolCreationCap and registers the permission pair, so nobody can
 /// front-run migration by creating the pool first), optionally executes
@@ -278,7 +371,7 @@ public struct CreatorTransferredEvent<phantom Base, phantom Quote> has copy, dro
 public fun create_token<Base, Quote>(
     cfg: &mut LaunchpadConfig,
     currency: &mut Currency<Base>,
-    treasury_cap: TreasuryCap<Base>,
+    receipt: FactoryReceipt<Base>,
     creation_fee: Coin<Quote>,
     threshold: Option<u64>,
     description: String,
@@ -304,20 +397,18 @@ public fun create_token<Base, Quote>(
     assert!(creation_fee.value() == quote_params.quote_creation_fee(), EWrongCreationFee);
     send_funds(creation_fee, cfg.treasury());
 
-    // Base coin sanity: fresh supply, expected decimals, and a metadata
-    // cap that nobody claimed before us.
-    let mut treasury_cap = treasury_cap;
+    // Unwrap the factory receipt. Holding it proves the base coin was created
+    // by `seal` via the unregulated constructor (provenance gate); the treasury
+    // cap and metadata cap are the matched pair `seal` produced.
+    let FactoryReceipt { id: receipt_id, treasury: mut treasury_cap, metadata_cap } = receipt;
+    receipt_id.delete();
+
+    // Base coin sanity: fresh supply and the expected decimals.
     assert!(treasury_cap.total_supply() == 0, ESupplyNotZero);
     assert!(coin_registry::decimals(currency) == cfg.base_decimals(), EDecimalsMismatch);
-    assert!(!coin_registry::is_metadata_cap_claimed(currency), EMetadataCapClaimed);
-    // Reject regulated base coins: a creator keeping a DenyCapV2 could
-    // deny-list every other holder and become the only address able to
-    // sell (honeypot). Note the legacy-migration path leaves the state
-    // Unknown and `is_regulated` false; a hidden deny cap is only
-    // rejected once someone reveals it by calling the permissionless
-    // `coin_registry::migrate_regulated_state_by_metadata` with the
-    // coin's frozen RegulatedCoinMetadata object — run a keeper that
-    // does this for every new coin before listing it (see README).
+    // Redundant belt-and-suspenders: `seal` already guarantees the base coin
+    // is unregulated (the receipt could not exist otherwise), so this can never
+    // fire. Kept as a cheap defense-in-depth assertion.
     assert!(!coin_registry::is_regulated(currency), ERegulatedBase);
 
     // Mint the full fixed supply.
@@ -344,11 +435,10 @@ public fun create_token<Base, Quote>(
         ctx,
     );
 
-    // Take custody of the MetadataCap (stored in the pool below, so the
-    // creator keeps the right to update name/description/icon through
-    // update_base_metadata), then give up mint authority: supply becomes
-    // burn-only through the shared Currency object.
-    let metadata_cap = coin_registry::claim_metadata_cap(currency, &treasury_cap, ctx);
+    // The MetadataCap came from the receipt (claimed by `seal`'s finalize) and
+    // is stored in the pool below, so the creator keeps the right to update
+    // name/description/icon through update_base_metadata. Give up mint
+    // authority: supply becomes burn-only through the shared Currency object.
     coin_registry::make_supply_burn_only(currency, treasury_cap);
 
     let (virtual_base, virtual_quote, virtual_base_floor) =
@@ -408,6 +498,10 @@ public fun create_token<Base, Quote>(
             * ((initial_base + remain_base) as u128)
             * (threshold as u128)
             / (remain_base as u128);
+    // Independent per-lock-kind first-buy caps, in base units of total supply.
+    let supply = ((initial_base + remain_base) as u128);
+    let max_time_base = ((supply * (cfg.first_buy_time_cap_bps() as u128) / 10_000) as u64);
+    let max_tvl_base = ((supply * (cfg.first_buy_tvl_cap_bps() as u128) / 10_000) as u64);
     execute_tranche_buys(
         &mut pool,
         tranche_quote_in,
@@ -417,6 +511,8 @@ public fun create_token<Base, Quote>(
         cfg.min_lock_duration_ms(),
         quote_params.quote_min_tvl_target(),
         min_mcap_target,
+        max_time_base,
+        max_tvl_base,
         clock,
     );
 
@@ -429,7 +525,7 @@ public fun create_token<Base, Quote>(
 entry fun create_token_entry<Base, Quote>(
     cfg: &mut LaunchpadConfig,
     currency: &mut Currency<Base>,
-    treasury_cap: TreasuryCap<Base>,
+    receipt: FactoryReceipt<Base>,
     creation_fee: Coin<Quote>,
     threshold: Option<u64>,
     description: String,
@@ -448,7 +544,7 @@ entry fun create_token_entry<Base, Quote>(
     let change = create_token<Base, Quote>(
         cfg,
         currency,
-        treasury_cap,
+        receipt,
         creation_fee,
         threshold,
         description,
@@ -476,6 +572,8 @@ fun execute_tranche_buys<Base, Quote>(
     min_lock_duration_ms: u64,
     min_tvl_target: u64,
     min_mcap_target: u128,
+    max_time_base: u64,
+    max_tvl_base: u64,
     clock: &Clock,
 ) {
     let count = quote_in.length();
@@ -483,6 +581,10 @@ fun execute_tranche_buys<Base, Quote>(
     assert!(lock_param.length() == count, ETrancheVectorMismatch);
     assert!(count <= MAX_TRANCHES, ETooManyTranches);
 
+    // Cumulative base locked per lock kind; each capped independently so the
+    // two first-buy kinds stack without interfering.
+    let mut time_base = 0;
+    let mut tvl_base = 0;
     let mut i = 0;
     while (i < count) {
         let kind = lock_kind[i];
@@ -502,29 +604,47 @@ fun execute_tranche_buys<Base, Quote>(
         assert!(gross >= pool.min_buy_amount, EBelowMinBuy);
         assert!(payment.value() >= gross, EInsufficientPayment);
         let creator = pool.creator;
+        // Remaining first-buy budget for this lock kind. The buy is clamped to
+        // it; any quote beyond what fits under the cap is returned to the
+        // creator as change (rather than aborting the whole launch). TIME and
+        // TVL budgets are tracked independently so the two kinds stack.
+        let budget = if (kind == LOCK_KIND_TIME) max_time_base - time_base
+            else max_tvl_base - tvl_base;
         let (base_out, change) =
-            buy_internal(pool, payment.balance_mut().split(gross), creator, clock);
-        // The completing tranche buy may leave unused quote; return it.
+            buy_internal(pool, payment.balance_mut().split(gross), creator, budget, clock);
+        // Cap-clamped (and/or completion-clamped) excess quote returns to payment.
         let quote_spent = gross - change.value();
         payment.balance_mut().join(change);
 
         let base_locked = base_out.value();
-        pool.tranches.push_back(CreatorTranche {
-            locked: base_out,
-            kind,
-            unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
-            tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
-            claimed: false,
-        });
-        event::emit(TrancheLockedEvent<Base, Quote> {
-            pool_id: pool.id.to_inner(),
-            index: i,
-            kind,
-            unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
-            tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
-            quote_in: quote_spent,
-            base_locked,
-        });
+        if (kind == LOCK_KIND_TIME) time_base = time_base + base_locked
+        else tvl_base = tvl_base + base_locked;
+        if (base_locked == 0) {
+            // This lock kind's cap was already exhausted by an earlier tranche;
+            // nothing to lock (the quote was fully refunded above). Skip it
+            // rather than record a no-op tranche.
+            base_out.destroy_zero();
+        } else {
+            // Emit the on-chain tranche index (matches unlock calls), not the
+            // input-vector index, so skipped no-ops don't shift it.
+            let tranche_index = pool.tranches.length();
+            pool.tranches.push_back(CreatorTranche {
+                locked: base_out,
+                kind,
+                unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
+                tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
+                claimed: false,
+            });
+            event::emit(TrancheLockedEvent<Base, Quote> {
+                pool_id: pool.id.to_inner(),
+                index: tranche_index,
+                kind,
+                unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
+                tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
+                quote_in: quote_spent,
+                base_locked,
+            });
+        };
         i = i + 1;
     };
 }
@@ -546,7 +666,7 @@ public fun buy<Base, Quote>(
     assert!(quote_in.value() >= pool.min_buy_amount, EBelowMinBuy);
 
     let (base_out, change) =
-        buy_internal(pool, quote_in.into_balance(), ctx.sender(), clock);
+        buy_internal(pool, quote_in.into_balance(), ctx.sender(), NO_FIRST_BUY_CAP, clock);
     assert!(base_out.value() >= min_base_out, ESlippage);
     (base_out.into_coin(ctx), change.into_coin(ctx))
 }
@@ -620,6 +740,7 @@ fun buy_internal<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     mut quote_in: Balance<Quote>,
     trader: address,
+    max_base_out: u64,
     clock: &Clock,
 ): (Balance<Base>, Balance<Quote>) {
     pool.assert_pool_version();
@@ -629,18 +750,22 @@ fun buy_internal<Base, Quote>(
     let fee = curve::fee_amount(gross, pool.curve_fee_bps);
     let net = gross - fee;
 
+    // Clamp base output to the smaller of the remaining curve (completion) and
+    // an optional per-buy cap: creator first-buys pass their remaining cap
+    // budget; public buys pass NO_FIRST_BUY_CAP. Excess quote is returned.
     let sellable = pool.virtual_base - pool.virtual_base_floor;
+    let cap = if (sellable < max_base_out) sellable else max_base_out;
     let (out, new_vb, new_vq) = curve::buy_out(pool.virtual_base, pool.virtual_quote, net);
     assert!(out > 0, EZeroOutput);
 
-    let (base_out_amount, net_used, fee_used, new_vb, new_vq) = if (out >= sellable) {
-        // Completing buy: charge only what the remaining range costs.
+    let (base_out_amount, net_used, fee_used, new_vb, new_vq) = if (out >= cap) {
+        // Charge only what the clamped range costs; the rest is caller change.
         let (cost, new_vb, new_vq) = curve::buy_cost_exact_out(
             pool.virtual_base,
             pool.virtual_quote,
-            sellable,
+            cap,
         );
-        (sellable, cost, curve::fee_amount(cost, pool.curve_fee_bps), new_vb, new_vq)
+        (cap, cost, curve::fee_amount(cost, pool.curve_fee_bps), new_vb, new_vq)
     } else {
         (out, net, fee, new_vb, new_vq)
     };

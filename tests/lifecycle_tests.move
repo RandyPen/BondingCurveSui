@@ -63,17 +63,15 @@ fun create_test_token(
     tranche_lock_param: vector<u64>,
     payment_amount: u64,
 ): Currency<ZZZ_BASE> {
-    // The test coin registry can only be created by the system address.
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) = mocks::new_base_currency<ZZZ_BASE>(6, scenario.ctx());
     scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<ZZZ_BASE>(scenario.ctx());
     let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
     let mut cfg = scenario.take_shared<LaunchpadConfig>();
     let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
     let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
         &mut cfg,
         &mut currency,
-        cap,
+        receipt,
         mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
         option::none(),
         b"".to_string(),
@@ -235,39 +233,11 @@ fun create_token_rejects_unlisted_quote() {
     end(scenario, clock, currency);
 }
 
-#[test, expected_failure(abort_code = pool::EDecimalsMismatch)]
-fun create_token_rejects_wrong_decimals() {
-    let (mut scenario, clock) = setup();
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) = mocks::new_base_currency<ZZZ_BASE>(9, scenario.ctx());
-    scenario.next_tx(CREATOR);
-    let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
-    let mut cfg = scenario.take_shared<LaunchpadConfig>();
-    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
-    let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
-        &mut cfg,
-        &mut currency,
-        cap,
-        mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
-        option::none(),
-        b"".to_string(),
-        b"".to_string(),
-        b"".to_string(),
-        b"".to_string(),
-        vector[],
-        vector[],
-        vector[],
-        mocks::mint_quote<MOCK_QUOTE>(0, scenario.ctx()),
-        cetus_config,
-        cetus_pools,
-        &clock,
-        scenario.ctx(),
-    );
-    mocks::destroy_cetus_env(cetus_env);
-    transfer::public_transfer(change, CREATOR);
-    ts::return_shared(cfg);
-    end(scenario, clock, currency);
-}
+// `create_token_rejects_wrong_decimals` was removed: `seal` hard-codes the base
+// decimals to the platform standard (9) and is the only way to obtain the
+// receipt `create_token` requires, so a wrong-decimals base coin can no longer
+// reach `create_token`. The `EDecimalsMismatch` assertion remains as defense
+// against an admin misconfiguring `base_decimals` away from 9.
 
 #[test, expected_failure(abort_code = config::EBaseAlreadyLaunched)]
 fun create_token_rejects_duplicate_base() {
@@ -287,16 +257,15 @@ fun create_token_rejects_duplicate_base() {
 #[test, expected_failure(abort_code = pool::EWrongCreationFee)]
 fun create_token_rejects_wrong_creation_fee() {
     let (mut scenario, clock) = setup();
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) = mocks::new_base_currency<ZZZ_BASE>(6, scenario.ctx());
     scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<ZZZ_BASE>(scenario.ctx());
     let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
     let mut cfg = scenario.take_shared<LaunchpadConfig>();
     let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
     let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
         &mut cfg,
         &mut currency,
-        cap,
+        receipt,
         mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE - 1, scenario.ctx()),
         option::none(),
         b"".to_string(),

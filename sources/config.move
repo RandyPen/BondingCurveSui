@@ -99,6 +99,11 @@ public struct LaunchpadConfig has key {
     /// launch's graduation market cap, or it would unlock immediately
     /// after migration.
     tvl_target_multiplier: u64,
+    /// Cap on the creator's TIME-locked first-buy, in bps of total supply (I+R).
+    first_buy_time_cap_bps: u64,
+    /// Cap on the creator's TVL-locked first-buy, in bps of total supply (I+R).
+    /// The TIME and TVL caps are independent and stack.
+    first_buy_tvl_cap_bps: u64,
     /// Quote-coin whitelist.
     quotes: Table<TypeName, QuoteParams>,
     /// Base coin type -> pool object ID; enforces one launch per base.
@@ -131,6 +136,8 @@ public struct LaunchParamsUpdatedEvent has copy, drop {
     tick_spacing: u32,
     min_lock_duration_ms: u64,
     tvl_target_multiplier: u64,
+    first_buy_time_cap_bps: u64,
+    first_buy_tvl_cap_bps: u64,
 }
 
 public struct TreasuryUpdatedEvent has copy, drop {
@@ -155,9 +162,9 @@ fun init(ctx: &mut TxContext) {
         version: VERSION,
         paused: false,
         treasury: ctx.sender(),
-        base_decimals: 6,
-        initial_virtual_base: 800_000_000_000_000, // 800M with 6 decimals
-        remain_base: 200_000_000_000_000, // 200M with 6 decimals
+        base_decimals: 9, // platform standard; must equal pool::STD_BASE_DECIMALS
+        initial_virtual_base: 800_000_000_000_000_000, // 800M with 9 decimals
+        remain_base: 200_000_000_000_000_000, // 200M with 9 decimals
         curve_fee_bps: 100, // 1%
         curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
         lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
@@ -165,6 +172,8 @@ fun init(ctx: &mut TxContext) {
         tick_spacing: 200, // Cetus 1% fee tier
         min_lock_duration_ms: 24 * 60 * 60 * 1000, // 24 hours
         tvl_target_multiplier: 3,
+        first_buy_time_cap_bps: 300, // 3% for time-locked first-buys
+        first_buy_tvl_cap_bps: 500, // 5% for tvl-locked first-buys
         quotes: table::new(ctx),
         pools: table::new(ctx),
     });
@@ -268,10 +277,17 @@ public fun set_launch_params(
     tick_spacing: u32,
     min_lock_duration_ms: u64,
     tvl_target_multiplier: u64,
+    first_buy_time_cap_bps: u64,
+    first_buy_tvl_cap_bps: u64,
 ) {
     cfg.assert_version();
     assert!(remain_base > 0 && initial_virtual_base > remain_base, EInvalidLaunchParams);
     assert!(tvl_target_multiplier > 0, EInvalidLaunchParams);
+    assert!(first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= 10_000, EInvalidLaunchParams);
+    assert!(first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= 10_000, EInvalidLaunchParams);
+    // Base decimals are locked at the platform standard: `pool::seal` hard-codes
+    // 9, so any other value would abort every future launch (EDecimalsMismatch).
+    assert!(base_decimals == 9, EInvalidLaunchParams);
     // Keep the curve/migration inside Cetus's price envelope: an extreme
     // initial/remain ratio can push the CLMM seed sqrt price out of the
     // representable range and permanently block migration.
@@ -285,6 +301,8 @@ public fun set_launch_params(
     cfg.tick_spacing = tick_spacing;
     cfg.min_lock_duration_ms = min_lock_duration_ms;
     cfg.tvl_target_multiplier = tvl_target_multiplier;
+    cfg.first_buy_time_cap_bps = first_buy_time_cap_bps;
+    cfg.first_buy_tvl_cap_bps = first_buy_tvl_cap_bps;
     event::emit(LaunchParamsUpdatedEvent {
         base_decimals,
         initial_virtual_base,
@@ -292,6 +310,8 @@ public fun set_launch_params(
         tick_spacing,
         min_lock_duration_ms,
         tvl_target_multiplier,
+        first_buy_time_cap_bps,
+        first_buy_tvl_cap_bps,
     });
 }
 
@@ -373,6 +393,8 @@ public fun tick_spacing(cfg: &LaunchpadConfig): u32 { cfg.tick_spacing }
 public fun min_lock_duration_ms(cfg: &LaunchpadConfig): u64 { cfg.min_lock_duration_ms }
 
 public fun tvl_target_multiplier(cfg: &LaunchpadConfig): u64 { cfg.tvl_target_multiplier }
+public fun first_buy_time_cap_bps(cfg: &LaunchpadConfig): u64 { cfg.first_buy_time_cap_bps }
+public fun first_buy_tvl_cap_bps(cfg: &LaunchpadConfig): u64 { cfg.first_buy_tvl_cap_bps }
 
 public fun is_paused(cfg: &LaunchpadConfig): bool { cfg.paused }
 
@@ -431,5 +453,29 @@ fun new_quote_params(
 
 #[test_only]
 public fun init_for_testing(ctx: &mut TxContext) {
-    init(ctx);
+    // base_decimals must be 9 (to match `pool::seal`'s sealed coins), but the
+    // curve amounts are kept at the small synthetic scale the tests are written
+    // against, independent of the production defaults.
+    transfer::transfer(AdminCap { id: object::new(ctx) }, ctx.sender());
+    transfer::share_object(LaunchpadConfig {
+        id: object::new(ctx),
+        version: VERSION,
+        paused: false,
+        treasury: ctx.sender(),
+        base_decimals: 9,
+        initial_virtual_base: 800_000_000_000_000,
+        remain_base: 200_000_000_000_000,
+        curve_fee_bps: 100,
+        curve_fee_platform_bps: 7_000,
+        lp_fee_platform_bps: 5_000,
+        migration_fee_bps: 500,
+        tick_spacing: 200,
+        min_lock_duration_ms: 24 * 60 * 60 * 1000,
+        tvl_target_multiplier: 3,
+        // no caps in tests; existing tranche tests use large first-buys
+        first_buy_time_cap_bps: 10_000,
+        first_buy_tvl_cap_bps: 10_000,
+        quotes: table::new(ctx),
+        pools: table::new(ctx),
+    });
 }

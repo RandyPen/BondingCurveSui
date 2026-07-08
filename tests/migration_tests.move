@@ -71,9 +71,8 @@ fun launch_and_complete<B: drop>(
     cetus_env: &mut mocks::CetusEnv,
     tvl_target: Option<u64>,
 ): Currency<B> {
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) = mocks::new_base_currency<B>(6, scenario.ctx());
     scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<B>(scenario.ctx());
     {
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
         let (tranche_in, kinds, params) = if (tvl_target.is_some()) {
@@ -89,7 +88,7 @@ fun launch_and_complete<B: drop>(
         let change = pool::create_token<B, MOCK_QUOTE>(
             &mut cfg,
             &mut currency,
-            cap,
+            receipt,
             mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
             option::none(),
             b"".to_string(),
@@ -370,16 +369,15 @@ fun migrate_with_zero_fee_seeds_full_amounts() {
 #[test, expected_failure(abort_code = pool::ENotCompleted)]
 fun migrate_rejected_while_trading() {
     let (mut scenario, clock, mut cetus_env) = setup();
-    scenario.next_tx(@0x0);
-    let (cap, mut currency) = mocks::new_base_currency<ZZZ_BASE>(6, scenario.ctx());
     scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<ZZZ_BASE>(scenario.ctx());
     {
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
         let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
         let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
             &mut cfg,
             &mut currency,
-            cap,
+            receipt,
             mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
             option::none(),
             b"".to_string(),
