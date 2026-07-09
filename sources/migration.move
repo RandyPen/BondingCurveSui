@@ -276,7 +276,6 @@ fun assert_claimable<Base, Quote>(
     base_is_coin_a: bool,
 ) {
     cfg.assert_version();
-    pool.assert_pool_version();
     pool.assert_migrated();
     assert!(pool.cetus_pool_id() == option::some(cetus_pool_id), EWrongCetusPool);
     assert!(pool.base_is_coin_a() == option::some(base_is_coin_a), EWrongOrientation);
@@ -325,21 +324,24 @@ fun settle_lp_fees<Base, Quote>(
 /// unlock condition is a MARKET CAP target: circulating supply (read
 /// from the burn-only Currency, so burns lower it) times the CLMM price.
 entry fun unlock_tranche_tvl<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
     index: u64,
 ) {
-    do_unlock_tranche_tvl(pool, cetus_pool, currency, index)
+    do_unlock_tranche_tvl(cfg, pool, cetus_pool, currency, index)
 }
 
 public(package) fun do_unlock_tranche_tvl<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
     index: u64,
 ) {
     unlock_tranche_tvl_internal(
+        cfg,
         pool,
         object::id(cetus_pool),
         currency,
@@ -351,21 +353,24 @@ public(package) fun do_unlock_tranche_tvl<Base, Quote>(
 
 /// Variant for launches where `Base` is the Cetus pool's coin B.
 entry fun unlock_tranche_tvl_inverted<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
     index: u64,
 ) {
-    do_unlock_tranche_tvl_inverted(pool, cetus_pool, currency, index)
+    do_unlock_tranche_tvl_inverted(cfg, pool, cetus_pool, currency, index)
 }
 
 public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
     index: u64,
 ) {
     unlock_tranche_tvl_internal(
+        cfg,
         pool,
         object::id(cetus_pool),
         currency,
@@ -376,6 +381,7 @@ public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
 }
 
 fun unlock_tranche_tvl_internal<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool_id: ID,
     currency: &Currency<Base>,
@@ -383,7 +389,7 @@ fun unlock_tranche_tvl_internal<Base, Quote>(
     base_is_coin_a: bool,
     index: u64,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     pool.assert_migrated();
     assert!(pool.cetus_pool_id() == option::some(cetus_pool_id), EWrongCetusPool);
     assert!(pool.base_is_coin_a() == option::some(base_is_coin_a), EWrongOrientation);

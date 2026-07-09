@@ -328,7 +328,10 @@ public fun set_paused(_: &AdminCap, cfg: &mut LaunchpadConfig, paused: bool) {
 }
 
 /// After a package upgrade, raise the config's required version to the
-/// new package VERSION.
+/// new package VERSION. This is the single, global version gate: every
+/// stateful entry (config, pool, and migration) checks `cfg.version`, so
+/// one call here locks out the old package across all pools at once —
+/// there is no per-pool version to bump.
 public fun bump_config_version(_: &AdminCap, cfg: &mut LaunchpadConfig) {
     cfg.version = VERSION;
 }

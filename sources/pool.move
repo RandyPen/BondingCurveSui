@@ -22,13 +22,11 @@ use sui::coin_registry::{Self, Currency, MetadataCap};
 use sui::dynamic_object_field as dof;
 use sui::event;
 
-use bondingcurvesui::config::{Self, AdminCap, LaunchpadConfig};
+use bondingcurvesui::config::{Self, LaunchpadConfig};
 use bondingcurvesui::curve;
 
 // === Errors ===
 
-/// Pool version is newer than this package supports.
-const EVersionMismatch: u64 = 1;
 /// Curve is not in the trading phase.
 const ENotTrading: u64 = 2;
 /// Curve has not completed yet.
@@ -86,7 +84,6 @@ const ENoPendingCreator: u64 = 27;
 
 // === Constants ===
 
-const VERSION: u64 = 1;
 const MAX_TRANCHES: u64 = 16;
 /// Sentinel passed to `buy_internal` for public buys: no first-buy cap (only
 /// the curve-completion clamp applies).
@@ -157,7 +154,6 @@ public struct CreatorTranche<phantom Base> has store {
 
 public struct Pool<phantom Base, phantom Quote> has key {
     id: UID,
-    version: u64,
     creator: address,
     /// Nominated next creator (two-step transfer); `creator` keeps every
     /// right until the nominee accepts.
@@ -446,7 +442,6 @@ public fun create_token<Base, Quote>(
 
     let mut pool = Pool<Base, Quote> {
         id: object::new(ctx),
-        version: VERSION,
         creator: ctx.sender(),
         pending_creator: option::none(),
         phase: PHASE_TRADING,
@@ -680,7 +675,6 @@ public fun sell<Base, Quote>(
     ctx: &mut TxContext,
 ): Coin<Quote> {
     cfg.assert_version();
-    pool.assert_pool_version();
     assert!(pool.phase == PHASE_TRADING, ENotTrading);
 
     let amount_in = base_in.value();
@@ -743,7 +737,6 @@ fun buy_internal<Base, Quote>(
     max_base_out: u64,
     clock: &Clock,
 ): (Balance<Base>, Balance<Quote>) {
-    pool.assert_pool_version();
     assert!(pool.phase == PHASE_TRADING, ENotTrading);
 
     let gross = quote_in.value();
@@ -817,7 +810,6 @@ public fun distribute_curve_fees<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
 ) {
     cfg.assert_version();
-    pool.assert_pool_version();
     let platform_amount = pool.platform_fees.value();
     let creator_amount = pool.creator_fees.value();
     if (platform_amount > 0) {
@@ -840,11 +832,12 @@ public fun distribute_curve_fees<Base, Quote>(
 /// Permissionless trigger; the tokens always go to the pool creator.
 /// Time-locked tranches unlock in any phase.
 public fun unlock_tranche_time<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     index: u64,
     clock: &Clock,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     let now = clock.timestamp_ms();
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
@@ -873,11 +866,12 @@ public fun unlock_tranche_time<Base, Quote>(
 /// Creator-only: nominate the next creator. Overwrites any pending
 /// nomination.
 public fun nominate_creator<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     to: address,
     ctx: &TxContext,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     assert!(ctx.sender() == pool.creator, ENotCreator);
     pool.pending_creator = option::some(to);
     event::emit(CreatorNominatedEvent<Base, Quote> {
@@ -889,10 +883,11 @@ public fun nominate_creator<Base, Quote>(
 
 /// Creator-only: withdraw the pending nomination.
 public fun cancel_creator_nomination<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     ctx: &TxContext,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     assert!(ctx.sender() == pool.creator, ENotCreator);
     assert!(pool.pending_creator.is_some(), ENoPendingCreator);
     let nominee = pool.pending_creator.extract();
@@ -905,10 +900,11 @@ public fun cancel_creator_nomination<Base, Quote>(
 
 /// Nominee-only: complete the transfer and take over the creator role.
 public fun accept_creator<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     ctx: &TxContext,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     assert!(pool.pending_creator == option::some(ctx.sender()), ENotPendingCreator);
     pool.pending_creator = option::none();
     event::emit(CreatorTransferredEvent<Base, Quote> {
@@ -923,6 +919,7 @@ public fun accept_creator<Base, Quote>(
 
 /// Creator-only: replace the pool's project description and links.
 public fun update_project_info<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     description: String,
     twitter: String,
@@ -930,7 +927,7 @@ public fun update_project_info<Base, Quote>(
     website: String,
     ctx: &TxContext,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     assert!(ctx.sender() == pool.creator, ENotCreator);
     pool.project = new_project_info(description, twitter, telegram, website);
     event::emit(ProjectInfoUpdatedEvent<Base, Quote> {
@@ -970,6 +967,7 @@ public fun project_info<Base, Quote>(
 /// MetadataCap held by the pool. The symbol is immutable in
 /// coin_registry; pass none for fields to leave unchanged.
 public fun update_base_metadata<Base, Quote>(
+    cfg: &LaunchpadConfig,
     pool: &Pool<Base, Quote>,
     currency: &mut Currency<Base>,
     mut name: Option<String>,
@@ -977,7 +975,7 @@ public fun update_base_metadata<Base, Quote>(
     mut icon_url: Option<String>,
     ctx: &TxContext,
 ) {
-    pool.assert_pool_version();
+    cfg.assert_version();
     assert!(ctx.sender() == pool.creator, ENotCreator);
     let cap = dof::borrow<MetadataCapKey, MetadataCap<Base>>(&pool.id, MetadataCapKey {});
     if (name.is_some()) {
@@ -1100,17 +1098,6 @@ public fun completed_at_ms<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
     pool.completed_at_ms
 }
 
-// === Admin ===
-
-/// After a package upgrade, raise a pool's version to the new package
-/// VERSION.
-public fun bump_pool_version<Base, Quote>(
-    _: &AdminCap,
-    pool: &mut Pool<Base, Quote>,
-) {
-    pool.version = VERSION;
-}
-
 // === Package-internal API (migration module) ===
 
 /// Hands the migration module everything that seeds the CLMM pool:
@@ -1119,7 +1106,6 @@ public fun bump_pool_version<Base, Quote>(
 public(package) fun withdraw_for_migration<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
 ): (Balance<Base>, Balance<Quote>) {
-    pool.assert_pool_version();
     assert!(pool.phase == PHASE_COMPLETED, ENotCompleted);
     let mut base = pool.lp_base_reserve.withdraw_all();
     // The drain clamp empties base_reserve exactly; join defensively.
@@ -1170,7 +1156,6 @@ public(package) fun take_tvl_tranche<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     index: u64,
 ): (Balance<Base>, address) {
-    pool.assert_pool_version();
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
     let tranche = pool.borrow_tranche_mut(index);
@@ -1193,9 +1178,6 @@ public(package) fun tranche_tvl_target<Base, Quote>(
     pool.tranches[index].tvl_target
 }
 
-public(package) fun assert_pool_version<Base, Quote>(pool: &Pool<Base, Quote>) {
-    assert!(pool.version <= VERSION, EVersionMismatch);
-}
 
 public(package) fun assert_migrated<Base, Quote>(pool: &Pool<Base, Quote>) {
     assert!(pool.phase == PHASE_MIGRATED, ENotMigrated);

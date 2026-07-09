@@ -427,15 +427,18 @@ fun tvl_tranche_unlocks_when_target_reached() {
 
     scenario.next_tx(TRADER); // permissionless trigger
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
         migration::do_unlock_tranche_tvl(
+            &cfg,
             &mut pool,
             &cetus_pool,
             &currency,
             0);
         let (_, _, _, locked, claimed) = pool.tranche_info(0);
         assert!(locked == 0 && claimed);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(cetus_pool);
     };
@@ -456,15 +459,18 @@ fun tvl_tranche_unlocks_inverted_orientation() {
 
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<AAA_BASE, MOCK_QUOTE>>();
         let cetus_pool = scenario.take_shared<CetusPool<MOCK_QUOTE, AAA_BASE>>();
         migration::do_unlock_tranche_tvl_inverted(
+            &cfg,
             &mut pool,
             &cetus_pool,
             &currency,
             0);
         let (_, _, _, locked, claimed) = pool.tranche_info(0);
         assert!(locked == 0 && claimed);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(cetus_pool);
     };
@@ -484,13 +490,16 @@ fun tvl_tranche_locked_below_target() {
 
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
         migration::do_unlock_tranche_tvl(
+            &cfg,
             &mut pool,
             &cetus_pool,
             &currency,
             0);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(cetus_pool);
     };
@@ -515,7 +524,9 @@ fun tvl_tranche_locked_before_migration() {
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let fake_pool =
             scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-        migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0);
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        migration::do_unlock_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(fake_pool);
     };
@@ -625,7 +636,9 @@ fun tvl_unlock_rejects_foreign_cetus_pool() {
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let fake_pool =
             scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
-        migration::do_unlock_tranche_tvl(&mut pool, &fake_pool, &currency, 0);
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        migration::do_unlock_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(fake_pool);
     };

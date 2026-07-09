@@ -590,10 +590,12 @@ fun time_tranche_unlocks_at_boundary() {
     clock.set_for_testing(1_000 + MIN_LOCK_MS); // exactly at the unlock timestamp
     scenario.next_tx(TRADER); // permissionless: anyone can trigger
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
         let (_, _, _, locked, claimed) = pool.tranche_info(0);
         assert!(locked == 0 && claimed);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         // Funds went to the creator's address balance; verify via event.
         let events = sui::event::events_by_type<
@@ -621,8 +623,10 @@ fun time_tranche_locked_before_boundary() {
     clock.set_for_testing(1_000 + MIN_LOCK_MS - 1);
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -643,9 +647,11 @@ fun tranche_cannot_be_claimed_twice() {
     clock.set_for_testing(2_000 + MIN_LOCK_MS);
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -661,8 +667,10 @@ fun creator_can_update_project_info() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"a meme with a plan".to_string(),
             b"https://x.com/meme".to_string(),
@@ -675,6 +683,7 @@ fun creator_can_update_project_info() {
         assert!(twitter == b"https://x.com/meme".to_string());
         assert!(telegram == b"https://t.me/meme".to_string());
         assert!(website == b"https://meme.xyz".to_string());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -686,18 +695,22 @@ fun creator_can_update_project_info() {
 fun transfer_creator_role(scenario: &mut Scenario) {
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, NEW_CREATOR, scenario.ctx());
         assert!(pool.pending_creator() == option::some(NEW_CREATOR));
         assert!(pool.creator() == CREATOR); // unchanged until accepted
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     scenario.next_tx(NEW_CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::accept_creator(&mut pool, scenario.ctx());
+        pool::accept_creator(&cfg, &mut pool, scenario.ctx());
         assert!(pool.creator() == NEW_CREATOR);
         assert!(pool.pending_creator().is_none());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
 }
@@ -712,8 +725,10 @@ fun creator_can_transfer_role() {
     // The settings rights follow the role.
     scenario.next_tx(NEW_CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"under new management".to_string(),
             b"".to_string(),
@@ -723,6 +738,7 @@ fun creator_can_transfer_role() {
         );
         let (description, _, _, _) = pool.project_info();
         assert!(description == b"under new management".to_string());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -736,10 +752,12 @@ fun creator_keeps_rights_while_nomination_pending() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, NEW_CREATOR, scenario.ctx());
         // Still the creator: settings rights keep working.
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"still mine".to_string(),
             b"".to_string(),
@@ -749,6 +767,7 @@ fun creator_keeps_rights_while_nomination_pending() {
         );
         let (description, _, _, _) = pool.project_info();
         assert!(description == b"still mine".to_string());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -762,15 +781,19 @@ fun nominee_has_no_rights_while_pending() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, NEW_CREATOR, scenario.ctx());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     scenario.next_tx(NEW_CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         // Nominated but not yet accepted: no settings rights.
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"".to_string(),
             b"".to_string(),
@@ -778,6 +801,7 @@ fun nominee_has_no_rights_while_pending() {
             b"".to_string(),
             scenario.ctx(),
         );
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -792,9 +816,11 @@ fun old_creator_loses_rights_after_transfer() {
     transfer_creator_role(&mut scenario);
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         // The old creator can no longer act on the pool.
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"".to_string(),
             b"".to_string(),
@@ -802,6 +828,7 @@ fun old_creator_loses_rights_after_transfer() {
             b"".to_string(),
             scenario.ctx(),
         );
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -815,8 +842,10 @@ fun non_creator_cannot_nominate() {
     );
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, TRADER, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, TRADER, scenario.ctx());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -830,14 +859,18 @@ fun accept_requires_matching_nomination() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, NEW_CREATOR, scenario.ctx());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     scenario.next_tx(TRADER); // not the nominee
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::accept_creator(&mut pool, scenario.ctx());
+        pool::accept_creator(&cfg, &mut pool, scenario.ctx());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -851,16 +884,20 @@ fun cancelled_nomination_cannot_be_accepted() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::nominate_creator(&mut pool, NEW_CREATOR, scenario.ctx());
-        pool::cancel_creator_nomination(&mut pool, scenario.ctx());
+        pool::nominate_creator(&cfg, &mut pool, NEW_CREATOR, scenario.ctx());
+        pool::cancel_creator_nomination(&cfg, &mut pool, scenario.ctx());
         assert!(pool.pending_creator().is_none());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     scenario.next_tx(NEW_CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::accept_creator(&mut pool, scenario.ctx());
+        pool::accept_creator(&cfg, &mut pool, scenario.ctx());
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -882,8 +919,10 @@ fun tranche_unlock_pays_new_creator_after_transfer() {
     clock.set_for_testing(1_000 + MIN_LOCK_MS);
     scenario.next_tx(TRADER); // permissionless crank
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
         // A tranche locked before the transfer pays the new creator.
         let events = sui::event::events_by_type<
@@ -904,6 +943,7 @@ fun project_info_rejects_oversized_link() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let mut long = b"".to_string();
         let mut i = 0u64;
@@ -912,6 +952,7 @@ fun project_info_rejects_oversized_link() {
             i = i + 1;
         };
         pool::update_project_info(
+            &cfg,
             &mut pool,
             b"".to_string(),
             long,
@@ -919,6 +960,7 @@ fun project_info_rejects_oversized_link() {
             b"".to_string(),
             scenario.ctx(),
         );
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -934,8 +976,10 @@ fun creator_can_update_metadata() {
     );
     scenario.next_tx(CREATOR);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         pool::update_base_metadata(
+            &cfg,
             &pool,
             &mut currency,
             option::some(b"Renamed Coin".to_string()),
@@ -943,6 +987,7 @@ fun creator_can_update_metadata() {
             option::some(b"https://example.com/icon.png".to_string()),
             scenario.ctx(),
         );
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     assert!(coin_registry::name(&currency) == b"Renamed Coin".to_string());
@@ -960,8 +1005,10 @@ fun non_creator_cannot_update_metadata() {
     );
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         pool::update_base_metadata(
+            &cfg,
             &pool,
             &mut currency,
             option::some(b"Hijacked".to_string()),
@@ -969,6 +1016,7 @@ fun non_creator_cannot_update_metadata() {
             option::none(),
             scenario.ctx(),
         );
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
@@ -991,9 +1039,11 @@ fun tvl_tranche_rejects_time_unlock_path() {
     clock.set_for_testing(99_000_000);
     scenario.next_tx(TRADER);
     {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         // Time-unlock entry must not release a TVL tranche.
-        pool::unlock_tranche_time(&mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        ts::return_shared(cfg);
         ts::return_shared(pool);
     };
     end(scenario, clock, currency);
