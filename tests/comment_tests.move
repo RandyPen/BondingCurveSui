@@ -232,6 +232,58 @@ fun forged_reply_to_is_accepted_on_chain_by_design() {
     end(scenario, clock, currency);
 }
 
+/// Reimplements Sui's object-id derivation from PUBLIC primitives only:
+/// `blake2b256(0xF1 || tx_digest || le_u64(ids_created))`. `tx_context::digest`,
+/// `sui::hash::blake2b256` and `sui::address::from_bytes` are all public, so any
+/// package can run this at execution time. The 0xF1 domain separator is a
+/// constant (recoverable by a <=256-case brute force), NOT a secret.
+fun predict_next_id(digest: vector<u8>, ids_created: u64): address {
+    let mut preimage = vector<u8>[0xF1];
+    preimage.append(digest);
+    preimage.append(sui::bcs::to_bytes(&ids_created)); // BCS u64 == little-endian
+    sui::address::from_bytes(sui::hash::blake2b256(&preimage))
+}
+
+#[test]
+/// SECURITY: the reply graph is NOT acyclic. A caller can predict the id `post`
+/// is about to mint and hand it straight back as `reply_to`, producing a comment
+/// that replies to itself — a 1-cycle. Two such calls give a 2-cycle.
+///
+/// This works because `post` is `public fun`, so the prediction happens at
+/// EXECUTION time from `ctx.digest()`. The "a pure argument can't contain a
+/// value derived from its own tx digest" argument is true but irrelevant here:
+/// nothing has to cross the argument boundary.
+///
+/// Consequence for consumers: never walk `reply_to` links unmemoized or without
+/// a depth cap — see skills/launchpad-data/SKILL.md. If this test ever fails,
+/// the derivation changed; the guidance still stands (2-cycles are unfixable
+/// on-chain without storing comment state).
+fun reply_graph_can_contain_a_cycle() {
+    let (mut scenario, clock, currency) = setup_with_pool();
+    scenario.next_tx(ALICE);
+    {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let ctx = scenario.ctx();
+
+        // An attacker's own first PTB command knows this is 0; `ids_created()`
+        // is test-only, but the VALUE is contextual knowledge, not a secret.
+        let n = ctx.ids_created();
+        let predicted = predict_next_id(*ctx.digest(), n);
+
+        comment::post(&cfg, &pool, b"i reply to myself".to_string(), option::some(predicted), ctx);
+        ts::return_shared(cfg);
+        ts::return_shared(pool);
+
+        let events = sui::event::events_by_type<CommentPostedEvent<ZZZ_BASE, MOCK_QUOTE>>();
+        let (_, comment_id, _, reply_to, _) = comment::comment_posted_event_fields(&events[0]);
+
+        assert!(predicted == comment_id);                  // the prediction is exact
+        assert!(reply_to == option::some(comment_id));     // ... and it is a self-reply
+    };
+    end(scenario, clock, currency);
+}
+
 // === Body validation ===
 
 #[test, expected_failure(abort_code = comment::EEmptyComment)]

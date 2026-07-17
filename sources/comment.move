@@ -3,8 +3,11 @@
 ///
 /// `post` borrows the pool IMMUTABLY, so a comment never write-conflicts with
 /// a trade on that pool's shared object. That upholds the property `pool`'s
-/// module doc already claims (trades never contend with anything but trades),
-/// and the borrow checker enforces it — there is nothing to test.
+/// module doc already claims (trades never contend with anything but trades).
+/// Note the guarantee is only half Move's: the immutable borrow means this
+/// module CANNOT take the write lock, but a client still chooses whether to
+/// declare the shared input mutable in its PTB. Declaring it immutable is a
+/// caller obligation, not something the borrow checker can enforce here.
 ///
 /// The comment id is `ctx.fresh_object_address()`: a globally unique address
 /// that no object occupies and that, per the framework, can never collide with
@@ -18,6 +21,19 @@
 /// edge against their own ingested set and refuse the ones that do not hold —
 /// see `skills/launchpad-data/SKILL.md`. Do not "fix" this by adding state
 /// without re-reading that contract first.
+///
+/// THE REPLY GRAPH CAN CONTAIN CYCLES. A comment id is
+/// `blake2b256(0x00 || tx_digest || le_u64(ids_created))` and every input is
+/// readable from Move at runtime (`tx_context::digest`, `sui::hash::blake2b256`
+/// and `sui::address::from_bytes` are all public; a caller's first PTB command
+/// knows `ids_created == 0`). Since `post` is `public fun`, another package can
+/// predict the id this call is about to mint and pass it straight back as
+/// `reply_to` — giving a self-reply, or a 2-cycle across two calls. Passing
+/// `reply_to` as a PURE argument cannot do this (it would need a hash fixed
+/// point), so do not mistake that for a guarantee. Consumers must enforce
+/// acyclicity themselves: cap depth and never walk parent links unmemoized.
+/// A self-reply assert here would kill only the trivial case and give false
+/// comfort, since 2-cycles are unfixable on-chain without storing state.
 module bondingcurvesui::comment;
 
 use std::string::String;
@@ -38,12 +54,14 @@ const ECommentTooLong: u64 = 2;
 /// Maximum comment body, in BYTES — `String::length` is a byte count, so this
 /// is 15000 ASCII characters but exactly 5000 CJK ones (3 bytes each).
 ///
-/// The hard ceiling is 16382, not the event size limit (`max_event_emit_size`,
-/// 256000) but the PURE ARGUMENT limit (`max_pure_argument_size`, 16384): a
-/// String arg serializes as a 2-byte ULEB128 length prefix plus its bytes, so
-/// 16383 would be rejected by the node before Move runs. This sits ~1.4KB under
-/// that — note the ceiling is a protocol config, not a constant, so it could in
-/// principle move.
+/// For an HONEST client the ceiling is 16382: not the event size limit
+/// (`max_event_emit_size`, 256000) but the PURE ARGUMENT limit
+/// (`max_pure_argument_size`, 16384), since a String arg serializes as a 2-byte
+/// ULEB128 length prefix plus its bytes. That is context, NOT a guard: `post`
+/// is `public fun`, so another package can build a body on-chain (doubling a
+/// 1-byte seed) and never cross the argument boundary at all. The assert below
+/// is therefore load-bearing — it is the ONLY thing bounding body length. Do
+/// not remove it as redundant.
 ///
 /// Exposed as `max_comment_len()` so a frontend counter reads the live limit
 /// instead of hard-coding a copy. A body this long must be truncated for
