@@ -518,3 +518,65 @@ fun admin_cap_transfers_only_via_contract_function() {
     clock.destroy_for_testing();
     scenario.end();
 }
+
+// === Version gate ===
+
+fun version_setup(): Scenario {
+    let mut scenario = ts::begin(ADMIN);
+    config::init_for_testing(scenario.ctx());
+    scenario.next_tx(ADMIN);
+    scenario
+}
+
+/// The decisive case: an upgrade never removes the old package, so the old
+/// package's copy of `bump_config_version` stays callable forever. It must
+/// not pull `version` back down to its own VERSION and re-admit itself.
+#[test, expected_failure(abort_code = config::EVersionNotNewer)]
+fun bump_rejects_downgrade_from_older_package() {
+    let scenario = version_setup();
+    let admin_cap = scenario.take_from_sender<AdminCap>();
+    let mut cfg = scenario.take_shared<LaunchpadConfig>();
+    // As if a newer package had already bumped the config past this one.
+    config::set_version_for_testing(&mut cfg, config::package_version_for_testing() + 1);
+    config::bump_config_version(&admin_cap, &mut cfg);
+    abort
+}
+
+/// init leaves the config at this package's VERSION, so there is nothing to
+/// bump; the guard rejects the no-op rather than silently succeeding.
+#[test, expected_failure(abort_code = config::EVersionNotNewer)]
+fun bump_rejects_same_version() {
+    let scenario = version_setup();
+    let admin_cap = scenario.take_from_sender<AdminCap>();
+    let mut cfg = scenario.take_shared<LaunchpadConfig>();
+    config::bump_config_version(&admin_cap, &mut cfg);
+    abort
+}
+
+/// The upgrade path itself: a config left behind by an older package is
+/// raised to the calling package's VERSION.
+#[test]
+fun bump_raises_config_to_package_version() {
+    let scenario = version_setup();
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_version_for_testing(&mut cfg, config::package_version_for_testing() - 1);
+        config::bump_config_version(&admin_cap, &mut cfg);
+        assert!(config::version_for_testing(&cfg) == config::package_version_for_testing());
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    scenario.end();
+}
+
+/// Once a newer package has bumped the config, this package's gated entries
+/// abort — the property the whole gate exists for.
+#[test, expected_failure(abort_code = config::EVersionMismatch)]
+fun bumped_config_locks_out_this_package() {
+    let scenario = version_setup();
+    let mut cfg = scenario.take_shared<LaunchpadConfig>();
+    config::set_version_for_testing(&mut cfg, config::package_version_for_testing() + 1);
+    config::assert_version(&cfg);
+    abort
+}

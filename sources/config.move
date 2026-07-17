@@ -25,6 +25,8 @@ const EInvalidLaunchParams: u64 = 6;
 const EBaseAlreadyLaunched: u64 = 7;
 /// Threshold below the per-quote minimum.
 const EThresholdTooLow: u64 = 8;
+/// Calling package's VERSION does not exceed the config's current version.
+const EVersionNotNewer: u64 = 9;
 
 // === Constants ===
 
@@ -332,7 +334,16 @@ public fun set_paused(_: &AdminCap, cfg: &mut LaunchpadConfig, paused: bool) {
 /// stateful entry (config, pool, and migration) checks `cfg.version`, so
 /// one call here locks out the old package across all pools at once —
 /// there is no per-pool version to bump.
+///
+/// The bump is monotonic: it aborts unless the calling package is strictly
+/// newer than the config. An upgraded package never removes its
+/// predecessor, which stays callable forever at its own address; without
+/// this guard the old package's copy of this function would set `version`
+/// back down to its own VERSION and re-admit itself. Every published
+/// version must carry this guard, since the check that matters lives in
+/// the *old* package's bytecode, which is frozen at publish time.
 public fun bump_config_version(_: &AdminCap, cfg: &mut LaunchpadConfig) {
+    assert!(VERSION > cfg.version, EVersionNotNewer);
     cfg.version = VERSION;
 }
 
@@ -453,6 +464,24 @@ fun new_quote_params(
 }
 
 // === Test helpers ===
+
+/// Forces `cfg.version`, standing in for a config that some other package
+/// version has bumped. Tests need this because a single published package
+/// only ever sees one VERSION.
+#[test_only]
+public fun set_version_for_testing(cfg: &mut LaunchpadConfig, version: u64) {
+    cfg.version = version;
+}
+
+#[test_only]
+public fun version_for_testing(cfg: &LaunchpadConfig): u64 {
+    cfg.version
+}
+
+#[test_only]
+public fun package_version_for_testing(): u64 {
+    VERSION
+}
 
 #[test_only]
 public fun init_for_testing(ctx: &mut TxContext) {
