@@ -43,6 +43,24 @@ const MAX_REFERRAL_BPS: u64 = 1_000;
 /// Upper bound on initial_virtual_base / remain_base (see
 /// set_launch_params).
 const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
+/// Floor on the CLMM base leg: 1 whole token at the platform's 9 decimals.
+/// Migration cannot be paused and a COMPLETED pool has no exit, so a launch
+/// that seeds a degenerate CLMM position strands its raise forever. Three
+/// such aborts live just below this floor, all deterministic and permanent:
+///   * `base_seed = remain_base * quote_net / quote_amount` floors to 0, so
+///     the coin handed to Cetus is empty and `add_liquidity_fix_coin` aborts
+///     `EAmountIncorrect` (reachable at `remain_base == 1` for ANY raise);
+///   * the seed liquidity itself floors to 0 for a few-raw-unit base leg,
+///     tripping Cetus's `ELiquidityCheckFailed`;
+///   * the liquidity probe overflows u64 in `get_delta_b`, which needs
+///     `sqrt(remain_base) <= initial/remain` — impossible once this floor
+///     exceeds MAX_INITIAL_TO_REMAIN_RATIO squared.
+/// Rejecting the config is recoverable; aborting the migration is not.
+const MIN_REMAIN_BASE: u64 = 1_000_000_000;
+/// Floor on a quote's `min_threshold`, for the same reason: a raise of 1 raw
+/// unit makes the ceiled migration fee consume it whole (`quote_net == 0`),
+/// which floors `base_seed` to 0 and bricks migration exactly as above.
+const MIN_QUOTE_THRESHOLD: u64 = 1_000;
 /// Ceiling on a TVL tranche's vesting schedule: 10 years. Keeps
 /// `total_locked * vested_ms` (both u64) far inside u128 in the release
 /// ratio, and stops an admin from setting a schedule that never completes.
@@ -315,7 +333,8 @@ public fun set_launch_params(
     first_buy_tvl_cap_bps: u64,
 ) {
     cfg.assert_version();
-    assert!(remain_base > 0 && initial_virtual_base > remain_base, EInvalidLaunchParams);
+    assert!(remain_base >= MIN_REMAIN_BASE, EInvalidLaunchParams);
+    assert!(initial_virtual_base > remain_base, EInvalidLaunchParams);
     assert!(tvl_target_multiplier > 0, EInvalidLaunchParams);
     assert!(first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= 10_000, EInvalidLaunchParams);
     assert!(first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= 10_000, EInvalidLaunchParams);
@@ -507,7 +526,8 @@ fun new_quote_params(
     min_buy_amount: u64,
     min_tvl_target: u64,
 ): QuoteParams {
-    assert!(default_threshold >= min_threshold && min_threshold > 0, EThresholdTooLow);
+    assert!(default_threshold >= min_threshold, EThresholdTooLow);
+    assert!(min_threshold >= MIN_QUOTE_THRESHOLD, EThresholdTooLow);
     QuoteParams {
         enabled: true,
         decimals,

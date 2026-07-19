@@ -295,9 +295,11 @@ fun launch_params_reject_extreme_ratio() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        // initial/remain ratio of 2000 exceeds the 1000 cap.
+        // initial/remain ratio of 2000 exceeds the 1000 cap. Scaled so
+        // remain_base clears MIN_REMAIN_BASE and the ratio assert is what
+        // fires.
         config::set_launch_params(
-            &admin_cap, &mut cfg, 9, 2_000_000_000, 1_000_000, 200, 0, 3, 300, 500,
+            &admin_cap, &mut cfg, 9, 2_000_000_000_000, 1_000_000_000, 200, 0, 3, 300, 500,
         );
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
@@ -483,7 +485,11 @@ fun launch_params_reject_remain_ge_initial() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_launch_params(&admin_cap, &mut cfg, 6, 1_000, 1_000, 200, 0, 3, 300, 500);
+        // Both legs above MIN_REMAIN_BASE, so the equal-reserves assert is
+        // what fires rather than the floor.
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9, 1_000_000_000, 1_000_000_000, 200, 0, 3, 300, 500,
+        );
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -615,4 +621,49 @@ fun bumped_config_locks_out_this_package() {
     config::set_version_for_testing(&mut cfg, config::package_version_for_testing() + 1);
     config::assert_version(&cfg);
     abort
+}
+
+// === Degenerate-launch floors ===
+
+// Migration cannot be paused and a COMPLETED pool cannot sell, so a launch
+// whose CLMM seed degenerates strands its raise permanently. These floors
+// move that failure to config time, where it is recoverable.
+
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// `remain_base = 1` floors `base_seed` to 0 for ANY raise, so the coin handed
+/// to Cetus would be empty and `add_liquidity_fix_coin` would abort.
+fun launch_params_reject_remain_base_below_floor() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9, 1_000_000_000_000, 999_999_999, 200, 0, 3, 300, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = config::EThresholdTooLow)]
+/// A raise of a few raw units lets the ceiled migration fee consume it whole,
+/// leaving `quote_net == 0` and the same empty seed.
+fun add_quote_rejects_min_threshold_below_floor() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        // ZZZ_BASE as an unregistered quote type: MOCK_QUOTE is already
+        // listed by `setup`, and the duplicate check fires before the
+        // threshold floor.
+        config::add_quote<ZZZ_BASE>(&admin_cap, &mut cfg, 6, 1_000_000, 999, 0, 1, 1);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
 }
