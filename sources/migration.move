@@ -216,15 +216,24 @@ fun migrate_core<Base, Quote>(
     // (`specs::cetus_model_specs::binding_leg_fallback_is_safe`) takes it as
     // a precondition: the seed price must clear both full-range endpoints by
     // ENVELOPE_GUARD, which is also exactly the condition under which Cetus's
-    // own u128 liquidity and `checked_shlw` do not abort. It holds by a wide
-    // margin under the `config` launch floors -- roughly 1000x at the lower
-    // endpoint -- but that argument lives a file away and rests on
-    // MIN_QUOTE_THRESHOLD and the EReserveOverflow bound. Relaxing either
-    // would silently invalidate the proof's precondition, and the failure
-    // mode is a permanent abort on a COMPLETED pool. So assert it: the abort
-    // is identical either way (Cetus rejects the price too), but it names the
-    // real cause here instead of surfacing from inside the dependency, and
-    // the proof's hypothesis becomes an enforced invariant rather than prose.
+    // own u128 liquidity and `checked_shlw` do not abort.
+    //
+    // That precondition is now PROVEN unreachable-by-violation:
+    // `specs::envelope_specs::seed_price_is_inside_envelope` shows both
+    // endpoints are cleared whenever each leg is at least 1000. The only
+    // config constant it needs is MIN_QUOTE_THRESHOLD -- NOT the
+    // EReserveOverflow bound on remain_base, which turns out not to be
+    // load-bearing here, so relaxing the launch-ratio bounds cannot reach
+    // this assert. Price margins at the reachable extremes are 15.8x at the
+    // lower endpoint and 31.6x at the upper (wider still once the reserve
+    // bound is counted).
+    //
+    // The assert stays anyway. The proof is about `curve::
+    // initial_sqrt_price_x64` and the endpoint literals; this is the runtime
+    // check that the two agree, and the failure mode it guards -- a
+    // permanent abort on a COMPLETED pool, whose raise can then never be
+    // recovered -- is severe enough to be worth naming at its real source
+    // rather than surfacing from inside the dependency.
     assert!(
         sqrt_price > (curve::full_range_lower_sqrt_price() as u128) + ENVELOPE_GUARD,
         ESeedPriceOutOfEnvelope,

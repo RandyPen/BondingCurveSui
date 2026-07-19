@@ -24,6 +24,29 @@ abort conditions (`asserts`) and proves:
 | `sell_out` | `new_vb = vb + base_in`; `quote_out <= vq` (solvency) with `new_vq = vq - quote_out`; invariant never decreases |
 | `fee_amount` | fee is exactly `ceil(amount * bps / 10_000)`; `fee <= amount` whenever `bps <= 10_000` |
 | `buy_then_sell_never_profits` (scenario) | buying with `quote_in` and selling the entire purchase back returns `quote_out <= quote_in` — a round trip can never drain quote from the pool |
+| `net_basis_fee_undercharges_boundedly` | for `net = gross - fee(gross)`: `fee(net) <= fee(gross)`, and the gap is at most `fee(fee(gross))` — bounds the `pool::buy_internal` clamped-branch fee-basis discrepancy |
+
+### Pool solvency (inductive step)
+
+Solvency is `vq >= vq0` (the pool tracks `quote_reserve == vq - vq0`). It is
+an inductive invariant with two conjuncts: **(K)** `vb*vq` never falls below
+`vb0*vq0`, and **(B)** `vb <= vb0`. (K) is pure curve arithmetic and is
+proven per operation below; (B) says users cannot sell back more base than
+the curve issued, which is enforced by Sui coin custody in `pool.move` and is
+**assumed as a hypothesis** here.
+
+| Spec | Property |
+|------|----------|
+| `buy_never_decreases_product` / `sell_never_decreases_product` / `exact_out_buy_never_decreases_product` | (K) per operation: `new_vb * new_vq >= vb * vq`, over `Integer`, plus the direction each reserve moves |
+| `product_and_base_bound_imply_solvency` | (K) && (B) => `vq >= vq0` (division-free) |
+| `buy_preserves_solvency_invariant` / `exact_out_buy_preserves_solvency_invariant` / `sell_preserves_solvency_invariant` | the inductive step: each operation re-establishes (K) && (B) and leaves the pool solvent; the sell case also proves `quote_out <= vq - vq0` |
+| `buy_then_sell_never_lowers_quote_reserve` | the pool-side companion to `buy_then_sell_never_profits`: a round trip ends with `vq2 >= vq` and the product non-decreasing |
+
+**Not proven:** the full induction over reachable pool states. These specs
+target pure functions with no notion of pool state, so nothing here quantifies
+over traces or establishes (B). Closing it needs a stateful prover (or a
+`pool.move` the prover could load) carrying (K) && (B) as a `Pool` struct
+invariant and discharging (B) from base-coin supply accounting.
 
 `clmm_math_specs.move` — CLMM price / TVL math:
 
@@ -31,7 +54,7 @@ abort conditions (`asserts`) and proves:
 |--------|-----------|
 | `isqrt` | result is the exact floored integer square root: `r^2 <= x < (r+1)^2`, proven against the Newton iteration via an external loop invariant |
 | `initial_sqrt_price_x64` | the returned Q64.64 sqrt price exactly brackets `floor(amount_b * 2^128 / amount_a)` |
-| `tvl_in_quote` | aborts only when dividing by a zero sqrt price (`!base_is_a` branch); TVL never undercounts the quote side; zero base means TVL equals the quote balance |
+| `tvl_in_quote` | aborts only when dividing by a zero sqrt price (`!base_is_a` branch); TVL never undercounts the quote side; zero base means TVL equals the quote balance; the result is the exact nested-floor value in both orientations, so it never overstates `base*price + quote` and is off by less than `sqrt_price/2^64 + 1`; monotone in the sqrt price (up when `base_is_a`, down otherwise); the u128 saturation clamp is unreachable for any sqrt price inside Cetus's global bounds |
 
 ## Running
 

@@ -1006,3 +1006,22 @@ fun full_range_sqrt_prices_match_cetus() {
     assert!(lo == curve::full_range_lower_sqrt_price());
     assert!(up == curve::full_range_upper_sqrt_price());
 }
+
+#[test]
+/// Pins Cetus's GLOBAL sqrt-price bounds, the companion obligation to the
+/// full-range constants above.
+///
+/// `clmm_math_specs::tvl_in_quote_clamp_is_unreachable` proves the u128
+/// saturation clamp in `curve::tvl_in_quote` cannot fire for any sqrt price
+/// inside these bounds -- which matters because a clamped market cap would
+/// read as a sentinel and auto-qualify the TVL gate. The proof hard-codes
+/// them as literals, since the specs package cannot load CetusClmm. Without
+/// this test that precondition would be an unpinned assumption: a dependency
+/// bump could widen the range and silently invalidate the proof rather than
+/// failing loudly here.
+fun global_sqrt_price_bounds_match_cetus() {
+    let min = cetus_clmm::tick_math::min_sqrt_price();
+    let max = cetus_clmm::tick_math::max_sqrt_price();
+    assert!(min == 4295048016);
+    assert!(max == 79226673515401279992447579055);
+}
