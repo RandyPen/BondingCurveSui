@@ -286,11 +286,10 @@ fun migrate_straight_order_creates_full_range_pool() {
         };
         assert!(diff <= expected_sqrt / 1_000_000); // within 1e-6 relative
 
-        // Launchpad reserves are empty and curve fees were flushed.
+        // Launchpad reserves are empty. Curve fees never rested here — they
+        // were paid out trade by trade — so there is no fee balance to check.
         let (base, lp_base, quote) = pool.real_reserves();
         assert!(base == 0 && lp_base == 0 && quote == 0);
-        let (platform_fees, creator_fees) = pool.accrued_fees();
-        assert!(platform_fees == 0 && creator_fees == 0);
         ts::return_shared(pool);
         ts::return_shared(cetus_pool);
     };

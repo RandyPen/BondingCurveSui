@@ -133,6 +133,15 @@ fun buy_as_referred(
     (base_out, change_out)
 }
 
+/// Curve fees are paid inside the trade, so the only record is the event.
+/// Must be called while still inside the trading transaction (i.e. before the
+/// next `next_tx`). Returns `(platform, creator, referral)`.
+fun last_curve_fees(): (u64, u64, u64) {
+    let events = sui::event::events_by_type<pool::CurveFeesPaidEvent<ZZZ_BASE, MOCK_QUOTE>>();
+    assert!(events.length() == 1);
+    pool::curve_fees_paid_event_amounts(&events[0])
+}
+
 fun sell_as(scenario: &mut Scenario, trader: address, min_out: u64): u64 {
     scenario.next_tx(trader);
     let cfg = scenario.take_shared<LaunchpadConfig>();
@@ -218,9 +227,10 @@ fun create_token_with_tranches_locks_first_buys() {
         assert!(locked1 > 0 && !claimed1);
         // Second tranche bought at a worse price than the first.
         assert!(locked1 < 2 * locked0);
-        // Fees accrued on both tranche buys.
-        let (platform_fees, creator_fees) = pool.accrued_fees();
-        assert!(platform_fees + creator_fees == 3_000_000); // 1% of 300M gross
+        // 1% taken on both tranche buys (300M gross); the fee itself has
+        // already been paid out, so it shows up as what the reserve kept.
+        let (_, _, quote_reserve) = pool.real_reserves();
+        assert!(quote_reserve == 300_000_000 - 3_000_000);
         ts::return_shared(pool);
     };
 
@@ -347,18 +357,14 @@ fun referred_buy_pays_out_of_platform_cut() {
     );
     assert!(base_out > 0);
 
-    scenario.next_tx(TRADER);
-    {
-        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let fee = 1_000_000; // 1% of gross
-        let (platform_fees, creator_fees) = pool.accrued_fees();
-        // Platform keeps 60% - 10% = 50%; the referrer's 10% is already paid.
-        assert!(platform_fees == fee * 5 / 10);
-        // The creator is untouched by referral: still the full 40%.
-        assert!(creator_fees == fee * 4 / 10);
-        assert!(platform_fees + creator_fees == fee - fee / 10);
-        ts::return_shared(pool);
-    };
+    let fee = 1_000_000; // 1% of gross
+    let (platform, creator, referral) = last_curve_fees();
+    // Platform keeps 60% - 10% = 50%; the referrer takes that 10%.
+    assert!(platform == fee * 5 / 10);
+    assert!(referral == fee * 1 / 10);
+    // The creator is untouched by referral: still the full 40%.
+    assert!(creator == fee * 4 / 10);
+    assert!(platform + creator + referral == fee);
     end(scenario, clock, currency);
 }
 
@@ -387,14 +393,15 @@ fun buy_and_sell_roundtrip_with_fees() {
     let (base_out, change) = buy_as(&mut scenario, &clock, TRADER, quote_in, 0);
     assert!(base_out > 0 && change == 0);
 
+    let fee = 1_000_000; // 1% of gross
+    let (platform, creator, referral) = last_curve_fees();
+    assert!(platform + creator == fee && referral == 0);
+    // 60/40 split from config defaults; unreferred, so no referral cut.
+    assert!(platform == fee * 6 / 10);
+
     scenario.next_tx(TRADER);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let fee = 1_000_000; // 1% of gross
-        let (platform_fees, creator_fees) = pool.accrued_fees();
-        assert!(platform_fees + creator_fees == fee);
-        // 60/40 split from config defaults; unreferred, so no referral cut.
-        assert!(platform_fees == fee * 6 / 10);
         let (_, _, quote_reserve) = pool.real_reserves();
         assert!(quote_reserve == quote_in - fee);
         ts::return_shared(pool);
@@ -594,39 +601,32 @@ fun pause_does_not_block_sells() {
 
 // === Fee distribution ===
 
+/// Fees are paid to the treasury and the creator inside the trade itself;
+/// nothing is left on the pool for a later crank to distribute. Payouts land
+/// in address balances (funds accumulator), not Coin objects, so the event is
+/// the only observable record.
 #[test]
-fun distribute_curve_fees_pays_treasury_and_creator() {
+fun curve_fees_are_paid_within_the_trade() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
         &mut scenario, &clock, vector[], vector[], vector[], 0,
     );
-    buy_as(&mut scenario, &clock, TRADER, 100_000_000, 0);
+    let quote_in = 100_000_000;
+    buy_as(&mut scenario, &clock, TRADER, quote_in, 0);
 
-    let (platform_expected, creator_expected);
+    let fee = 1_000_000; // 1% of gross
+    let (platform, creator, referral) = last_curve_fees();
+    assert!(platform > 0 && creator > 0 && referral == 0);
+    assert!(platform + creator == fee);
+
+    // The pool kept exactly the net, and holds no fee balance of its own.
     scenario.next_tx(TRADER);
     {
-        let cfg = scenario.take_shared<LaunchpadConfig>();
-        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let (p, c) = pool.accrued_fees();
-        platform_expected = p;
-        creator_expected = c;
-        pool::distribute_curve_fees(&cfg, &mut pool);
-        let (p2, c2) = pool.accrued_fees();
-        assert!(p2 == 0 && c2 == 0);
-        ts::return_shared(cfg);
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let (_, _, quote_reserve) = pool.real_reserves();
+        assert!(quote_reserve == quote_in - fee);
         ts::return_shared(pool);
-        // Payouts go to address balances (funds accumulator), not Coin
-        // objects; assert the exact amounts through the event.
-        let events = sui::event::events_by_type<
-            pool::CurveFeesDistributedEvent<ZZZ_BASE, MOCK_QUOTE>,
-        >();
-        assert!(events.length() == 1);
-        let (platform_paid, creator_paid) =
-            pool::fees_distributed_event_amounts(&events[0]);
-        assert!(platform_paid == platform_expected);
-        assert!(creator_paid == creator_expected);
     };
-    assert!(platform_expected > 0 && creator_expected > 0);
     end(scenario, clock, currency);
 }
 

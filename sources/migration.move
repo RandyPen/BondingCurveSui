@@ -197,7 +197,7 @@ fun migrate_core<Base, Quote>(
     let base_burned = base_burn.value();
     burn_or_destroy(currency, base_burn.into_coin(ctx));
     let quote_dust_to_platform = quote_left.value();
-    pool::accrue_platform_quote(pool, quote_left.into_balance());
+    pool::send_platform_quote(quote_left.into_balance(), cfg.treasury());
 
     let cetus_pool_id = position::pool_id(&position);
     pool::set_migrated(pool, cetus_pool_id, base_is_coin_a);
@@ -215,8 +215,6 @@ fun migrate_core<Base, Quote>(
         quote_dust_to_platform,
     });
 
-    // Flush curve fees now that the pool has reached its terminal phase.
-    pool::distribute_curve_fees(cfg, pool);
     position
 }
 

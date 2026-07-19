@@ -175,8 +175,6 @@ public struct Pool<phantom Base, phantom Quote> has key {
     /// Quote collected by the curve (net of fees).
     quote_reserve: Balance<Quote>,
     // Accrued curve fees, split at trade time.
-    platform_fees: Balance<Quote>,
-    creator_fees: Balance<Quote>,
     // Parameters snapshotted at launch; later admin config changes do
     // not affect live pools.
     curve_fee_bps: u64,
@@ -252,7 +250,6 @@ public struct TradedEvent<phantom Base, phantom Quote> has copy, drop {
 /// is no on-chain referral ledger, so this event is the record of record.
 public struct ReferralPaidEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
-    trader: address,
     referrer: address,
     amount: u64,
 }
@@ -262,10 +259,14 @@ public struct CurveCompletedEvent<phantom Base, phantom Quote> has copy, drop {
     quote_raised: u64,
 }
 
-public struct CurveFeesDistributedEvent<phantom Base, phantom Quote> has copy, drop {
+/// Emitted on every fee-bearing trade. Curve fees are paid out in the same
+/// transaction rather than accrued, so there is no pool-side balance to
+/// query: this event is the record of record for fee accounting.
+public struct CurveFeesPaidEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     platform_amount: u64,
     creator_amount: u64,
+    referral_amount: u64,
 }
 
 public struct TrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
@@ -464,8 +465,6 @@ public fun create_token<Base, Quote>(
         base_reserve,
         lp_base_reserve,
         quote_reserve: balance::zero(),
-        platform_fees: balance::zero(),
-        creator_fees: balance::zero(),
         curve_fee_bps: cfg.curve_fee_bps(),
         curve_fee_platform_bps: cfg.curve_fee_platform_bps(),
         referral_bps: cfg.referral_bps(),
@@ -521,6 +520,7 @@ public fun create_token<Base, Quote>(
         min_mcap_target,
         max_time_base,
         max_tvl_base,
+        cfg.treasury(),
         clock,
     );
 
@@ -582,6 +582,7 @@ fun execute_tranche_buys<Base, Quote>(
     min_mcap_target: u128,
     max_time_base: u64,
     max_tvl_base: u64,
+    treasury: address,
     clock: &Clock,
 ) {
     let count = quote_in.length();
@@ -626,6 +627,7 @@ fun execute_tranche_buys<Base, Quote>(
                 creator,
                 budget,
                 option::none(),
+                treasury,
                 clock,
             );
         // Cap-clamped (and/or completion-clamped) excess quote returns to payment.
@@ -689,6 +691,7 @@ public fun buy<Base, Quote>(
         ctx.sender(),
         NO_FIRST_BUY_CAP,
         referrer,
+        cfg.treasury(),
         clock,
     );
     assert!(base_out.value() >= min_base_out, ESlippage);
@@ -720,7 +723,7 @@ public fun sell<Base, Quote>(
     pool.virtual_quote = new_vq;
     pool.base_reserve.join(base_in.into_balance());
     let mut out = pool.quote_reserve.split(quote_out);
-    pool.accrue_fee(out.split(fee), ctx.sender(), referrer);
+    pool.accrue_fee(out.split(fee), referrer, cfg.treasury());
 
     event::emit(TradedEvent<Base, Quote> {
         pool_id: pool.id.to_inner(),
@@ -769,6 +772,7 @@ fun buy_internal<Base, Quote>(
     trader: address,
     max_base_out: u64,
     referrer: Option<address>,
+    treasury: address,
     clock: &Clock,
 ): (Balance<Base>, Balance<Quote>) {
     assert!(pool.phase == PHASE_TRADING, ENotTrading);
@@ -800,7 +804,7 @@ fun buy_internal<Base, Quote>(
     pool.virtual_base = new_vb;
     pool.virtual_quote = new_vq;
     pool.quote_reserve.join(quote_in.split(net_used));
-    pool.accrue_fee(quote_in.split(fee_used), trader, referrer);
+    pool.accrue_fee(quote_in.split(fee_used), referrer, treasury);
     // Whatever remains in quote_in is the caller's change.
 
     let base_out = pool.base_reserve.split(base_out_amount);
@@ -827,16 +831,27 @@ fun buy_internal<Base, Quote>(
     (base_out, quote_in)
 }
 
-/// Splits a trade's fee three ways: the referrer is paid immediately, the
-/// platform keeps its cut less that payout, and the creator takes the
-/// remainder. Because the referral share is carved out of the platform's cut
-/// (`referral_bps <= curve_fee_platform_bps`, enforced by `set_fee_params`),
-/// the creator's amount is bit-for-bit what it would be with no referrer.
+/// Splits a trade's fee three ways and pays all three out immediately: the
+/// referrer, the platform treasury, and the creator. Because the referral
+/// share is carved out of the platform's cut (`referral_bps <=
+/// curve_fee_platform_bps`, enforced by `set_fee_params`), the creator's
+/// amount is bit-for-bit what it would be with no referrer.
+///
+/// Nothing is held on the pool. Sui's funds accumulator makes a deposit an
+/// emitted merge event rather than a write to an input object, so paying
+/// three recipients per trade costs no storage, contends with nothing, and
+/// measures as zero extra gas against an accrue-then-claim build. Recipients
+/// come from stored state (`treasury`, `pool.creator`), never from the
+/// caller.
+///
+/// Consequence: fees follow whoever held the role *at trade time*. A creator
+/// who hands over the role via `accept_creator` keeps what they already
+/// earned instead of passing unclaimed accruals to the nominee.
 fun accrue_fee<Base, Quote>(
-    pool: &mut Pool<Base, Quote>,
+    pool: &Pool<Base, Quote>,
     mut fee: Balance<Quote>,
-    trader: address,
     referrer: Option<address>,
+    treasury: address,
 ) {
     let total = fee.value();
     let platform_cut = mul_div_bps(total, pool.curve_fee_platform_bps);
@@ -845,18 +860,32 @@ fun accrue_fee<Base, Quote>(
     } else {
         0
     };
-    pool.platform_fees.join(fee.split(platform_cut - referral_cut));
+    let platform_amount = platform_cut - referral_cut;
+    if (platform_amount > 0) {
+        balance::send_funds(fee.split(platform_amount), treasury);
+    };
     if (referral_cut > 0) {
         let referrer = *referrer.borrow();
         balance::send_funds(fee.split(referral_cut), referrer);
         event::emit(ReferralPaidEvent<Base, Quote> {
             pool_id: pool.id.to_inner(),
-            trader,
             referrer,
             amount: referral_cut,
         });
     };
-    pool.creator_fees.join(fee);
+    let creator_amount = fee.value();
+    let creator = pool.creator;
+    if (creator_amount > 0) {
+        balance::send_funds(fee, creator);
+    } else {
+        fee.destroy_zero();
+    };
+    event::emit(CurveFeesPaidEvent<Base, Quote> {
+        pool_id: pool.id.to_inner(),
+        platform_amount,
+        creator_amount,
+        referral_amount: referral_cut,
+    });
 }
 
 /// Self-referral would just be a fee rebate on your own trade. Rejecting it
@@ -870,31 +899,11 @@ fun mul_div_bps(amount: u64, bps: u64): u64 {
     ((amount as u128) * (bps as u128) / (config::bps_denominator() as u128)) as u64
 }
 
-// === Fee distribution ===
-
-/// Permissionless: pays accrued curve fees out to the platform treasury
-/// and the creator.
-public fun distribute_curve_fees<Base, Quote>(
-    cfg: &LaunchpadConfig,
-    pool: &mut Pool<Base, Quote>,
-) {
-    cfg.assert_version();
-    let platform_amount = pool.platform_fees.value();
-    let creator_amount = pool.creator_fees.value();
-    if (platform_amount > 0) {
-        balance::send_funds(pool.platform_fees.withdraw_all(), cfg.treasury());
-    };
-    if (creator_amount > 0) {
-        balance::send_funds(pool.creator_fees.withdraw_all(), pool.creator);
-    };
-    if (platform_amount > 0 || creator_amount > 0) {
-        event::emit(CurveFeesDistributedEvent<Base, Quote> {
-            pool_id: pool.id.to_inner(),
-            platform_amount,
-            creator_amount,
-        });
-    };
-}
+// Curve fees are paid out inside the trade that earns them (see
+// `accrue_fee`), so there is no accrued balance and nothing to distribute —
+// the former permissionless `distribute_curve_fees` crank is gone. LP fees
+// and rewards still need one, because collecting them requires passing
+// Cetus's own objects (see `migration::claim_lp_fees` / `claim_lp_rewards`).
 
 // === Creator tranche unlock (time path) ===
 
@@ -1111,9 +1120,8 @@ public fun real_reserves<Base, Quote>(pool: &Pool<Base, Quote>): (u64, u64, u64)
     (pool.base_reserve.value(), pool.lp_base_reserve.value(), pool.quote_reserve.value())
 }
 
-public fun accrued_fees<Base, Quote>(pool: &Pool<Base, Quote>): (u64, u64) {
-    (pool.platform_fees.value(), pool.creator_fees.value())
-}
+// `accrued_fees` is gone with the accrual balances: curve fees never rest on
+// the pool. Sum `CurveFeesPaidEvent` for per-pool fee totals.
 
 public fun tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
     pool.tranches.length()
@@ -1203,12 +1211,13 @@ public(package) fun store_burn_proof<Base, Quote>(
     pool.burn_proof.fill(proof);
 }
 
-/// Quote dust from migration joins the platform's accrued fees.
-public(package) fun accrue_platform_quote<Base, Quote>(
-    pool: &mut Pool<Base, Quote>,
-    quote: Balance<Quote>,
-) {
-    pool.platform_fees.join(quote);
+/// Quote dust left over from seeding the CLMM goes to the platform.
+public(package) fun send_platform_quote<Quote>(quote: Balance<Quote>, treasury: address) {
+    if (quote.value() > 0) {
+        balance::send_funds(quote, treasury);
+    } else {
+        quote.destroy_zero();
+    };
 }
 
 public(package) fun borrow_burn_proof_mut<Base, Quote>(
@@ -1298,10 +1307,11 @@ public fun tranche_locked_event_amounts<Base, Quote>(
 }
 
 #[test_only]
-public fun fees_distributed_event_amounts<Base, Quote>(
-    ev: &CurveFeesDistributedEvent<Base, Quote>,
-): (u64, u64) {
-    (ev.platform_amount, ev.creator_amount)
+/// `(platform_amount, creator_amount, referral_amount)`.
+public fun curve_fees_paid_event_amounts<Base, Quote>(
+    ev: &CurveFeesPaidEvent<Base, Quote>,
+): (u64, u64, u64) {
+    (ev.platform_amount, ev.creator_amount, ev.referral_amount)
 }
 
 #[test_only]
