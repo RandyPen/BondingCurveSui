@@ -35,8 +35,6 @@ use bondingcurvesui::pool::{Self, Pool};
 const EWrongCetusPool: u64 = 1;
 /// The passed Cetus pool orientation does not match the entry point.
 const EWrongOrientation: u64 = 2;
-/// CLMM pool TVL is below the tranche's target.
-const ETvlBelowTarget: u64 = 3;
 
 // === Events ===
 
@@ -67,12 +65,29 @@ public struct LpFeesClaimedEvent<phantom Base, phantom Quote> has copy, drop {
     quote_creator: u64,
 }
 
-public struct TvlTrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
+/// Emitted on every claim call, whether or not it opened the gate or released
+/// anything, so an indexer can plot release progress.
+///
+/// `sqrt_price_x64` and `market_cap_in_quote` are the values observed AT THE
+/// CALL. On the call that flips `gate_open` these are worth auditing: a gate
+/// opened at a price that never appears at any block boundary is the
+/// signature of a single-transaction pump, and the linear window gives
+/// holders the whole schedule to react to it.
+public struct TvlTrancheClaimedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     index: u64,
     /// Circulating supply (from the Currency) x CLMM price, in quote.
     market_cap_in_quote: u128,
     tvl_target: u64,
+    /// Whether the target held at this observation.
+    qualified: bool,
+    /// True once the gate has opened (including on this very call).
+    gate_open: bool,
+    /// Clock time the gate opened; the linear window runs from here.
+    gate_opened_at_ms: u64,
+    /// Base released by this call. Always zero on the gate-opening call.
+    amount: u64,
+    vesting_duration_ms: u64,
     sqrt_price_x64: u128,
     total_supply: u64,
 }
@@ -362,34 +377,57 @@ fun settle_lp_fees<Base, Quote>(
     });
 }
 
-// === TVL-based creator tranche unlock ===
+// === TVL creator tranche: market-cap gate, then linear release ===
 
-// These are `entry` on purpose and transfer to the creator instead of
-// returning the coin: the unlocked tokens cannot be consumed by later
-// commands of the same PTB, which breaks the atomic
-// "pump price -> unlock -> dump" composition.
+// A TVL tranche does not unlock on a cliff. The first call that sees the
+// market-cap target opens a one-way GATE, and the balance then releases
+// LINEARLY over the pool's `tvl_vesting_duration_ms`. After the gate opens
+// the price is never read again.
+//
+// Be clear about what this does and does not buy. The gate reads
+// `clmm_pool::current_sqrt_price`, a spot value anyone can move for the
+// length of one transaction, so forcing it open costs an attacker only a
+// round-trip through the pool — the gate is NOT the protection. The
+// protection is the window behind it:
+//
+//   * nothing releases in the instant the gate opens (elapsed time is zero),
+//     so pump -> open -> dump cannot happen atomically;
+//   * the creator's exit is rate-limited to the schedule, so holders can
+//     always sell ahead of it rather than being dumped on without warning;
+//   * the gate opening is a public event carrying the observed price, so a
+//     gate opened at a price no block boundary ever showed is detectable.
+//
+// A creator who forces the gate still ends up with the whole tranche
+// eventually. This is a deliberate trade of manipulation-resistance for
+// simplicity and creator UX; do not document it as a guarantee that the
+// target was genuinely met.
+//
+// Still `entry`, and payouts still go to the creator's address balance via
+// `send_funds`: both are now belt-and-suspenders, but free.
 
 /// Variant for launches where `Base` is the Cetus pool's coin A. The
-/// unlock condition is a MARKET CAP target: circulating supply (read
-/// from the burn-only Currency, so burns lower it) times the CLMM price.
-entry fun unlock_tranche_tvl<Base, Quote>(
+/// condition is a MARKET CAP target: circulating supply (read from the
+/// burn-only Currency, so burns lower it) times the CLMM price.
+entry fun claim_tranche_tvl<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
     index: u64,
+    clock: &Clock,
 ) {
-    do_unlock_tranche_tvl(cfg, pool, cetus_pool, currency, index)
+    do_claim_tranche_tvl(cfg, pool, cetus_pool, currency, index, clock)
 }
 
-public(package) fun do_unlock_tranche_tvl<Base, Quote>(
+public(package) fun do_claim_tranche_tvl<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
     index: u64,
+    clock: &Clock,
 ) {
-    unlock_tranche_tvl_internal(
+    claim_tranche_tvl_internal(
         cfg,
         pool,
         object::id(cetus_pool),
@@ -397,28 +435,31 @@ public(package) fun do_unlock_tranche_tvl<Base, Quote>(
         clmm_pool::current_sqrt_price(cetus_pool),
         true,
         index,
+        clock,
     );
 }
 
 /// Variant for launches where `Base` is the Cetus pool's coin B.
-entry fun unlock_tranche_tvl_inverted<Base, Quote>(
+entry fun claim_tranche_tvl_inverted<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
     index: u64,
+    clock: &Clock,
 ) {
-    do_unlock_tranche_tvl_inverted(cfg, pool, cetus_pool, currency, index)
+    do_claim_tranche_tvl_inverted(cfg, pool, cetus_pool, currency, index, clock)
 }
 
-public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
+public(package) fun do_claim_tranche_tvl_inverted<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
     index: u64,
+    clock: &Clock,
 ) {
-    unlock_tranche_tvl_internal(
+    claim_tranche_tvl_internal(
         cfg,
         pool,
         object::id(cetus_pool),
@@ -426,10 +467,11 @@ public(package) fun do_unlock_tranche_tvl_inverted<Base, Quote>(
         clmm_pool::current_sqrt_price(cetus_pool),
         false,
         index,
+        clock,
     );
 }
 
-fun unlock_tranche_tvl_internal<Base, Quote>(
+fun claim_tranche_tvl_internal<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
     cetus_pool_id: ID,
@@ -437,6 +479,7 @@ fun unlock_tranche_tvl_internal<Base, Quote>(
     sqrt_price_x64: u128,
     base_is_coin_a: bool,
     index: u64,
+    clock: &Clock,
 ) {
     cfg.assert_version();
     pool.assert_migrated();
@@ -452,18 +495,35 @@ fun unlock_tranche_tvl_internal<Base, Quote>(
     let market_cap =
         curve::tvl_in_quote(total_supply, 0, sqrt_price_x64, base_is_coin_a);
     let target = pool::tranche_tvl_target(pool, index);
-    assert!(market_cap >= (target as u128), ETvlBelowTarget);
+    // Below target is NOT an error. Once the gate is open the price is
+    // irrelevant, and before it opens a failed observation is just a no-op —
+    // aborting would make routine claim calls fail for no reason.
+    let qualified = market_cap >= (target as u128);
 
-    let (unlocked, creator) = pool::take_tvl_tranche(pool, index);
-    event::emit(TvlTrancheUnlockedEvent<Base, Quote> {
+    let (released, creator, gate_open, gate_opened_at_ms) =
+        pool::claim_tvl_tranche(pool, index, qualified, clock.timestamp_ms());
+    let amount = released.value();
+    event::emit(TvlTrancheClaimedEvent<Base, Quote> {
         pool_id: object::id(pool),
         index,
         market_cap_in_quote: market_cap,
         tvl_target: target,
+        qualified,
+        gate_open,
+        gate_opened_at_ms,
+        amount,
+        vesting_duration_ms: pool.tvl_vesting_duration_ms(),
         sqrt_price_x64,
         total_supply,
     });
-    sui::balance::send_funds(unlocked, creator);
+    // Most calls release nothing (not qualified, or the credited slice
+    // floored to zero), and `send_funds` is a native that takes the balance
+    // by value — so mirror the package's zero-guard rather than assume.
+    if (amount > 0) {
+        sui::balance::send_funds(released, creator);
+    } else {
+        released.destroy_zero();
+    };
 }
 
 // === Post-migration LP rewards (Cetus incentives) ===

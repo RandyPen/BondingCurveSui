@@ -43,6 +43,10 @@ const MAX_REFERRAL_BPS: u64 = 1_000;
 /// Upper bound on initial_virtual_base / remain_base (see
 /// set_launch_params).
 const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
+/// Ceiling on a TVL tranche's vesting schedule: 10 years. Keeps
+/// `total_locked * vested_ms` (both u64) far inside u128 in the release
+/// ratio, and stops an admin from setting a schedule that never completes.
+const MAX_TVL_VESTING_DURATION_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
 
 // === Structs ===
 
@@ -114,6 +118,12 @@ public struct LaunchpadConfig has key {
     /// Cap on the creator's TVL-locked first-buy, in bps of total supply (I+R).
     /// The TIME and TVL caps are independent and stack.
     first_buy_tvl_cap_bps: u64,
+    /// Once a TVL tranche's market-cap gate opens, how long the balance takes
+    /// to release linearly. This is the buyer-facing protection: the
+    /// creator's exit is rate-limited over this window, so nobody gets dumped
+    /// on without notice.
+    tvl_vesting_duration_ms: u64,
+
     /// Quote-coin whitelist.
     quotes: Table<TypeName, QuoteParams>,
     /// Base coin type -> pool object ID; enforces one launch per base.
@@ -151,6 +161,10 @@ public struct LaunchParamsUpdatedEvent has copy, drop {
     first_buy_tvl_cap_bps: u64,
 }
 
+public struct TvlVestingParamsUpdatedEvent has copy, drop {
+    tvl_vesting_duration_ms: u64,
+}
+
 public struct TreasuryUpdatedEvent has copy, drop {
     treasury: address,
 }
@@ -186,6 +200,7 @@ fun init(ctx: &mut TxContext) {
         tvl_target_multiplier: 3,
         first_buy_time_cap_bps: 300, // 3% for time-locked first-buys
         first_buy_tvl_cap_bps: 500, // 5% for tvl-locked first-buys
+        tvl_vesting_duration_ms: 10 * 24 * 60 * 60 * 1000, // 10-day linear release
         quotes: table::new(ctx),
         pools: table::new(ctx),
     });
@@ -334,6 +349,26 @@ public fun set_launch_params(
     });
 }
 
+/// Linear release window for a TVL tranche, applied once its market-cap gate
+/// opens. Kept out of `set_launch_params` because this window IS the buyer
+/// protection: the gate itself is a single spot-price observation and is
+/// cheap to force, so what stands between a creator and the tranche is the
+/// rate limit, not the condition.
+public fun set_tvl_vesting_params(
+    _: &AdminCap,
+    cfg: &mut LaunchpadConfig,
+    tvl_vesting_duration_ms: u64,
+) {
+    cfg.assert_version();
+    // Zero would divide by zero in the release ratio and, worse, would mean
+    // the gate opening releases everything at once — the cliff this window
+    // exists to remove.
+    assert!(tvl_vesting_duration_ms > 0, EInvalidLaunchParams);
+    assert!(tvl_vesting_duration_ms <= MAX_TVL_VESTING_DURATION_MS, EInvalidLaunchParams);
+    cfg.tvl_vesting_duration_ms = tvl_vesting_duration_ms;
+    event::emit(TvlVestingParamsUpdatedEvent { tvl_vesting_duration_ms });
+}
+
 public fun set_treasury(_: &AdminCap, cfg: &mut LaunchpadConfig, treasury: address) {
     cfg.assert_version();
     cfg.treasury = treasury;
@@ -428,6 +463,8 @@ public fun min_lock_duration_ms(cfg: &LaunchpadConfig): u64 { cfg.min_lock_durat
 public fun tvl_target_multiplier(cfg: &LaunchpadConfig): u64 { cfg.tvl_target_multiplier }
 public fun first_buy_time_cap_bps(cfg: &LaunchpadConfig): u64 { cfg.first_buy_time_cap_bps }
 public fun first_buy_tvl_cap_bps(cfg: &LaunchpadConfig): u64 { cfg.first_buy_tvl_cap_bps }
+
+public fun tvl_vesting_duration_ms(cfg: &LaunchpadConfig): u64 { cfg.tvl_vesting_duration_ms }
 
 public fun is_paused(cfg: &LaunchpadConfig): bool { cfg.paused }
 
@@ -527,6 +564,7 @@ public fun init_for_testing(ctx: &mut TxContext) {
         // no caps in tests; existing tranche tests use large first-buys
         first_buy_time_cap_bps: 10_000,
         first_buy_tvl_cap_bps: 10_000,
+        tvl_vesting_duration_ms: 10 * 24 * 60 * 60 * 1000,
         quotes: table::new(ctx),
         pools: table::new(ctx),
     });

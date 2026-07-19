@@ -34,6 +34,51 @@ const MIN_TVL_TARGET: u64 = 1_000;
 const REACHABLE_TVL_TARGET: u64 = 45_000_000_000; // exactly the minimum
 const UNREACHABLE_TVL_TARGET: u64 = 100_000_000_000;
 
+const VEST_MS: u64 = 24 * 60 * 60 * 1000;
+/// A quarter of the release window, so four steps drain a tranche.
+const STEP_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// One claim call at the clock's current time: opens the gate if the target
+/// is met, then releases whatever the linear window has produced.
+/// Permissionless, so TRADER drives it. Returns `(locked, gate_open)`.
+fun claim_straight<B: drop>(
+    scenario: &mut Scenario,
+    clock: &Clock,
+    currency: &Currency<B>,
+): (u64, bool) {
+    scenario.next_tx(TRADER);
+    let cfg = scenario.take_shared<LaunchpadConfig>();
+    let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
+    let cetus_pool = scenario.take_shared<CetusPool<B, MOCK_QUOTE>>();
+    migration::do_claim_tranche_tvl(&cfg, &mut pool, &cetus_pool, currency, 0, clock);
+    let (_, _, _, locked, _) = pool.tranche_info(0);
+    let (_, gate_open, _, _, _) = pool.tranche_vesting(0);
+    ts::return_shared(cfg);
+    ts::return_shared(pool);
+    ts::return_shared(cetus_pool);
+    (locked, gate_open)
+}
+
+fun claim_inverted<B: drop>(
+    scenario: &mut Scenario,
+    clock: &Clock,
+    currency: &Currency<B>,
+): (u64, bool) {
+    scenario.next_tx(TRADER);
+    let cfg = scenario.take_shared<LaunchpadConfig>();
+    let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
+    let cetus_pool = scenario.take_shared<CetusPool<MOCK_QUOTE, B>>();
+    migration::do_claim_tranche_tvl_inverted(
+        &cfg, &mut pool, &cetus_pool, currency, 0, clock,
+    );
+    let (_, _, _, locked, _) = pool.tranche_info(0);
+    let (_, gate_open, _, _, _) = pool.tranche_vesting(0);
+    ts::return_shared(cfg);
+    ts::return_shared(pool);
+    ts::return_shared(cetus_pool);
+    (locked, gate_open)
+}
+
 // === Helpers (generic over the base coin to cover both orderings) ===
 
 fun setup(): (Scenario, Clock, mocks::CetusEnv) {
@@ -53,6 +98,9 @@ fun setup(): (Scenario, Clock, mocks::CetusEnv) {
             MIN_BUY,
             MIN_TVL_TARGET,
         );
+        // 24h linear release once the gate opens (production default is 30
+        // days); four 6h steps drain it.
+        config::set_tvl_vesting_params(&admin_cap, &mut cfg, VEST_MS);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -412,8 +460,8 @@ fun migrate_cannot_run_twice() {
 // === TVL tranche unlock ===
 
 #[test]
-fun tvl_tranche_unlocks_when_target_reached() {
-    let (mut scenario, clock, mut cetus_env) = setup();
+fun tvl_tranche_releases_linearly_after_gate_opens() {
+    let (mut scenario, mut clock, mut cetus_env) = setup();
     let mut currency = launch_and_complete<ZZZ_BASE>(
         &mut scenario,
         &clock,
@@ -425,29 +473,31 @@ fun tvl_tranche_unlocks_when_target_reached() {
     // (45e9); the price must actually rise ~3x first.
     pump_price_straight(&mut scenario, &clock, &mut cetus_env);
 
-    scenario.next_tx(TRADER); // permissionless trigger
+    // First qualifying call opens the gate and releases NOTHING: zero time
+    // has elapsed in the linear window.
+    let (total, gate_open) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(gate_open);
+    // From here the price is irrelevant; release is pure wall-clock time.
+    let mut i = 0u64;
+    while (i < 4) {
+        clock.increment_for_testing(STEP_MS);
+        let (locked, _) = claim_straight(&mut scenario, &clock, &currency);
+        i = i + 1;
+        assert!(locked == total - total * i / 4);
+    };
+    scenario.next_tx(TRADER);
     {
-        let cfg = scenario.take_shared<LaunchpadConfig>();
-        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
-        migration::do_unlock_tranche_tvl(
-            &cfg,
-            &mut pool,
-            &cetus_pool,
-            &currency,
-            0);
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let (_, _, _, locked, claimed) = pool.tranche_info(0);
         assert!(locked == 0 && claimed);
-        ts::return_shared(cfg);
         ts::return_shared(pool);
-        ts::return_shared(cetus_pool);
     };
     end(scenario, clock, cetus_env, currency);
 }
 
 #[test]
-fun tvl_tranche_unlocks_inverted_orientation() {
-    let (mut scenario, clock, mut cetus_env) = setup();
+fun tvl_tranche_releases_linearly_inverted_orientation() {
+    let (mut scenario, mut clock, mut cetus_env) = setup();
     let mut currency = launch_and_complete<AAA_BASE>(
         &mut scenario,
         &clock,
@@ -457,29 +507,27 @@ fun tvl_tranche_unlocks_inverted_orientation() {
     migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
     pump_price_inverted(&mut scenario, &clock, &mut cetus_env);
 
+    let (_, gate_open) = claim_inverted(&mut scenario, &clock, &currency);
+    assert!(gate_open);
+    let mut i = 0u64;
+    while (i < 4) {
+        clock.increment_for_testing(STEP_MS);
+        claim_inverted(&mut scenario, &clock, &currency);
+        i = i + 1;
+    };
     scenario.next_tx(TRADER);
     {
-        let cfg = scenario.take_shared<LaunchpadConfig>();
-        let mut pool = scenario.take_shared<Pool<AAA_BASE, MOCK_QUOTE>>();
-        let cetus_pool = scenario.take_shared<CetusPool<MOCK_QUOTE, AAA_BASE>>();
-        migration::do_unlock_tranche_tvl_inverted(
-            &cfg,
-            &mut pool,
-            &cetus_pool,
-            &currency,
-            0);
+        let pool = scenario.take_shared<Pool<AAA_BASE, MOCK_QUOTE>>();
         let (_, _, _, locked, claimed) = pool.tranche_info(0);
         assert!(locked == 0 && claimed);
-        ts::return_shared(cfg);
         ts::return_shared(pool);
-        ts::return_shared(cetus_pool);
     };
     end(scenario, clock, cetus_env, currency);
 }
 
-#[test, expected_failure(abort_code = migration::ETvlBelowTarget)]
-fun tvl_tranche_locked_below_target() {
-    let (mut scenario, clock, mut cetus_env) = setup();
+#[test]
+fun tvl_tranche_gate_stays_shut_below_target() {
+    let (mut scenario, mut clock, mut cetus_env) = setup();
     let mut currency = launch_and_complete<ZZZ_BASE>(
         &mut scenario,
         &clock,
@@ -488,20 +536,18 @@ fun tvl_tranche_locked_below_target() {
     );
     migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
 
-    scenario.next_tx(TRADER);
-    {
-        let cfg = scenario.take_shared<LaunchpadConfig>();
-        let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
-        migration::do_unlock_tranche_tvl(
-            &cfg,
-            &mut pool,
-            &cetus_pool,
-            &currency,
-            0);
-        ts::return_shared(cfg);
-        ts::return_shared(pool);
-        ts::return_shared(cetus_pool);
+    // Never pumped, so the target never holds. Repeated calls must be
+    // harmless no-ops: the gate stays shut and nothing releases, no matter
+    // how much time passes.
+    let (locked0, gate_open) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(!gate_open);
+    let mut i = 0u64;
+    while (i < 4) {
+        clock.increment_for_testing(STEP_MS);
+        let (locked, open) = claim_straight(&mut scenario, &clock, &currency);
+        assert!(!open);
+        assert!(locked == locked0);
+        i = i + 1;
     };
     end(scenario, clock, cetus_env, currency);
 }
@@ -525,7 +571,7 @@ fun tvl_tranche_locked_before_migration() {
         let fake_pool =
             scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
         let cfg = scenario.take_shared<LaunchpadConfig>();
-        migration::do_unlock_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0);
+        migration::do_claim_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(fake_pool);
@@ -637,7 +683,7 @@ fun tvl_unlock_rejects_foreign_cetus_pool() {
         let fake_pool =
             scenario.take_shared_by_id<CetusPool<ZZZ_BASE, MOCK_QUOTE>>(fake_pool_id);
         let cfg = scenario.take_shared<LaunchpadConfig>();
-        migration::do_unlock_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0);
+        migration::do_claim_tranche_tvl(&cfg, &mut pool, &fake_pool, &currency, 0, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
         ts::return_shared(fake_pool);
@@ -802,4 +848,142 @@ fun migrates_above_crossover_base_is_coin_a() {
 #[test]
 fun migrates_above_crossover_base_is_coin_b() {
     assert_migrates_above_crossover<AAA_BASE>();
+}
+
+// === TVL gate + linear release: behavioural bounds ===
+
+/// Inverse of `pump_price_straight`: sells base back, pushing the price
+/// down below the tranche's target again.
+fun dump_price_straight(scenario: &mut Scenario, clock: &Clock, cetus_env: &mut mocks::CetusEnv) {
+    scenario.next_tx(TRADER);
+    let mut cetus_pool = scenario.take_shared<CetusPool<ZZZ_BASE, MOCK_QUOTE>>();
+    let (cetus_config, _) = cetus_env.cetus_refs();
+    let sp0 = cetus_clmm::pool::current_sqrt_price(&cetus_pool);
+    let limit = sp0 / 9 * 5; // undo the x1.8
+    let (base_out, quote_out, receipt) = cetus_clmm::pool::flash_swap<ZZZ_BASE, MOCK_QUOTE>(
+        cetus_config,
+        &mut cetus_pool,
+        true, // base (A) in, quote (B) out: price falls
+        true,
+        1_000_000_000_000_000,
+        limit,
+        clock,
+    );
+    let owed = cetus_clmm::pool::swap_pay_amount(&receipt);
+    cetus_clmm::pool::repay_flash_swap<ZZZ_BASE, MOCK_QUOTE>(
+        cetus_config,
+        &mut cetus_pool,
+        sui::coin::mint_for_testing<ZZZ_BASE>(owed, scenario.ctx()).into_balance(),
+        sui::balance::zero<MOCK_QUOTE>(),
+        receipt,
+    );
+    transfer::public_transfer(quote_out.into_coin(scenario.ctx()), TRADER);
+    base_out.destroy_zero();
+    ts::return_shared(cetus_pool);
+}
+
+#[test]
+/// The property the linear window exists for. A same-PTB pump can force the
+/// gate open, but zero time has elapsed in the release window at that
+/// instant, so the attacker collects NOTHING in that transaction — and can
+/// never collect faster than the schedule afterwards. This is what makes
+/// "pump -> unlock -> dump" impossible to do atomically.
+fun flash_pump_opens_gate_but_releases_nothing() {
+    let (mut scenario, clock, mut cetus_env) = setup();
+    let mut currency = launch_and_complete<ZZZ_BASE>(
+        &mut scenario,
+        &clock,
+        &mut cetus_env,
+        option::some(REACHABLE_TVL_TARGET),
+    );
+    migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+
+    let (total, gate_open) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(!gate_open); // below target before the pump
+
+    // Attacker moves the price ~3x and claims at the very same timestamp,
+    // as they would inside one PTB.
+    pump_price_straight(&mut scenario, &clock, &mut cetus_env);
+    let (locked, opened) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(opened);            // the gate IS forced open — it is cheap
+    assert!(locked == total);   // but nothing is released in that instant
+    // Hammering it in the same instant does not help either.
+    let (locked2, _) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(locked2 == total);
+    end(scenario, clock, cetus_env, currency);
+}
+
+#[test]
+/// Once open, the gate is one-way and the price is never read again: the
+/// release keeps running on wall-clock time even after the market falls back
+/// below the target. Documented deliberately — it is the flip side of the
+/// simple gate, and the reason the schedule (not the condition) is what
+/// protects buyers.
+fun release_continues_after_price_falls_back() {
+    let (mut scenario, mut clock, mut cetus_env) = setup();
+    let mut currency = launch_and_complete<ZZZ_BASE>(
+        &mut scenario,
+        &clock,
+        &mut cetus_env,
+        option::some(REACHABLE_TVL_TARGET),
+    );
+    migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+
+    pump_price_straight(&mut scenario, &clock, &mut cetus_env);
+    let (total, gate_open) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(gate_open);
+
+    // Price collapses back below the target.
+    dump_price_straight(&mut scenario, &clock, &mut cetus_env);
+
+    // Release still advances strictly on schedule, one quarter per step.
+    let mut i = 0u64;
+    while (i < 4) {
+        clock.increment_for_testing(STEP_MS);
+        let (locked, _) = claim_straight(&mut scenario, &clock, &currency);
+        i = i + 1;
+        assert!(locked == total - total * i / 4);
+    };
+    scenario.next_tx(TRADER);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let (_, _, _, locked, claimed) = pool.tranche_info(0);
+        assert!(locked == 0 && claimed);
+        ts::return_shared(pool);
+    };
+    // A completed tranche must stay a harmless no-op, not a permanent abort:
+    // a keeper polling every pool would otherwise start throwing forever the
+    // moment any schedule finishes.
+    clock.increment_for_testing(STEP_MS);
+    let (locked_after, _) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(locked_after == 0);
+    end(scenario, clock, cetus_env, currency);
+}
+
+#[test]
+/// The creator cannot outrun the schedule by claiming repeatedly: each call
+/// pays only the delta since the last one.
+fun repeated_claims_do_not_release_more_than_schedule() {
+    let (mut scenario, mut clock, mut cetus_env) = setup();
+    let mut currency = launch_and_complete<ZZZ_BASE>(
+        &mut scenario,
+        &clock,
+        &mut cetus_env,
+        option::some(REACHABLE_TVL_TARGET),
+    );
+    migrate(&mut scenario, &clock, &mut cetus_env, &mut currency);
+    pump_price_straight(&mut scenario, &clock, &mut cetus_env);
+    let (total, _) = claim_straight(&mut scenario, &clock, &currency);
+
+    clock.increment_for_testing(STEP_MS);
+    let (after_first, _) = claim_straight(&mut scenario, &clock, &currency);
+    assert!(after_first == total - total / 4);
+    // Five more claims at the same timestamp must each release zero.
+    let mut i = 0u64;
+    while (i < 5) {
+        let (locked, _) = claim_straight(&mut scenario, &clock, &currency);
+        assert!(locked == after_first);
+        i = i + 1;
+    };
+    end(scenario, clock, cetus_env, currency);
 }

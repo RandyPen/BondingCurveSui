@@ -143,15 +143,38 @@ public struct ProjectInfo has store, copy, drop {
 }
 
 /// A creator first-buy tranche, locked until its unlock condition holds.
+///
+/// TIME tranches are a cliff: the timestamp passes and the whole balance is
+/// released at once. TVL tranches instead pass through a one-way GATE and
+/// then release LINEARLY — see `claim_tvl_tranche`.
+///
+/// The gate is a single market-cap observation, read from a CLMM spot price
+/// that anyone can move for the length of one transaction, so it is cheap to
+/// force and deliberately not the protection. The protection is the linear
+/// window behind it: the creator's exit is rate-limited, the gate opening is
+/// a public event, and nothing at all releases in the instant the gate opens.
+/// A flash pump therefore buys notice-then-a-slow-drip, never a dump.
 public struct CreatorTranche<phantom Base> has store {
     locked: Balance<Base>,
     kind: u8,
     /// Unlock timestamp (ms) when `kind == LOCK_KIND_TIME`.
     unlock_ts_ms: u64,
-    /// Post-migration CLMM TVL target in quote units when
+    /// Post-migration CLMM market-cap target in quote units when
     /// `kind == LOCK_KIND_TVL`.
     tvl_target: u64,
     claimed: bool,
+    // === TVL gate + linear release state (unused by TIME tranches) ===
+    /// Balance at lock time; the numerator of the release ratio.
+    total_locked: u64,
+    /// True once the market-cap target has been observed. One-way: the gate
+    /// never closes and the price is never read again after it opens.
+    gate_open: bool,
+    /// Clock time the gate opened; the linear window runs from here. Paired
+    /// with `gate_open` rather than using 0 as a sentinel, so a genuine
+    /// timestamp of 0 cannot be mistaken for a closed gate.
+    gate_opened_at_ms: u64,
+    /// Cumulative amount already released, so each call pays only the delta.
+    withdrawn: u64,
 }
 
 public struct Pool<phantom Base, phantom Quote> has key {
@@ -184,6 +207,10 @@ public struct Pool<phantom Base, phantom Quote> has key {
     migration_fee_bps: u64,
     tick_spacing: u32,
     min_buy_amount: u64,
+    /// TVL-tranche linear release window, snapshotted like every other
+    /// economic parameter so a later admin change cannot retune a live
+    /// tranche.
+    tvl_vesting_duration_ms: u64,
     /// Project description and social links; creator-updatable.
     project: ProjectInfo,
     // Creator first-buy tranches.
@@ -472,6 +499,7 @@ public fun create_token<Base, Quote>(
         migration_fee_bps: cfg.migration_fee_bps(),
         tick_spacing: cfg.tick_spacing(),
         min_buy_amount: quote_params.quote_min_buy_amount(),
+        tvl_vesting_duration_ms: cfg.tvl_vesting_duration_ms(),
         project: new_project_info(description, twitter, telegram, website),
         tranches: vector[],
         pool_creation_cap,
@@ -652,6 +680,10 @@ fun execute_tranche_buys<Base, Quote>(
                 unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
                 tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
                 claimed: false,
+                total_locked: base_locked,
+                gate_open: false,
+                gate_opened_at_ms: 0,
+                withdrawn: 0,
             });
             event::emit(TrancheLockedEvent<Base, Quote> {
                 pool_id: pool.id.to_inner(),
@@ -1232,24 +1264,100 @@ public(package) fun borrow_creation_cap<Base, Quote>(
     &pool.pool_creation_cap
 }
 
-/// Takes a TVL tranche's balance after the migration module validated
-/// the TVL condition. Returns `(unlocked, creator)`.
-public(package) fun take_tvl_tranche<Base, Quote>(
+/// Opens a TVL tranche's gate if the target is met, then releases whatever
+/// the linear window has produced since it opened.
+///
+/// `qualified` is the migration module's verdict on the market-cap target at
+/// `now_ms`. The first qualifying call opens the gate and releases NOTHING —
+/// elapsed time is zero at that instant — which is what makes a same-PTB
+/// pump worthless: the attacker cannot pump, open, and collect atomically.
+/// After that the price is irrelevant; release is pure wall-clock time, so a
+/// creator claims whenever they like and cannot outrun the schedule.
+///
+/// Returns `(released, creator, gate_open, gate_opened_at_ms)`. A call before
+/// the gate opens, or one too soon after the last, is a legitimate no-op.
+public(package) fun claim_tvl_tranche<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     index: u64,
-): (Balance<Base>, address) {
+    qualified: bool,
+    now_ms: u64,
+): (Balance<Base>, address, bool, u64) {
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
+    let vesting_duration_ms = pool.tvl_vesting_duration_ms;
     let tranche = pool.borrow_tranche_mut(index);
     assert!(tranche.kind == LOCK_KIND_TVL, ETrancheLocked);
-    let unlocked = take_tranche(tranche);
-    event::emit(TrancheUnlockedEvent<Base, Quote> {
-        pool_id,
-        index,
-        amount: unlocked.value(),
-        creator,
-    });
-    (unlocked, creator)
+    // Deliberately no `!claimed` assert: once the window completes the
+    // arithmetic below yields a zero delta on its own, so a keeper polling
+    // every pool keeps getting harmless no-ops instead of permanent aborts.
+
+    if (!tranche.gate_open && qualified) {
+        tranche.gate_open = true;
+        tranche.gate_opened_at_ms = now_ms;
+    };
+
+    let releasable = if (tranche.gate_open) {
+        // Sui's Clock is monotonic, so this cannot underflow.
+        let elapsed = now_ms - tranche.gate_opened_at_ms;
+        let served = if (elapsed > vesting_duration_ms) vesting_duration_ms else elapsed;
+        // Floored, like every other rounding here: the remainder stays locked
+        // until the window completes, where the ratio is exactly 1 and the
+        // balance drains to zero with nothing stranded.
+        let entitled = (((tranche.total_locked as u128) * (served as u128)
+            / (vesting_duration_ms as u128)) as u64);
+        let delta = entitled - tranche.withdrawn;
+        tranche.withdrawn = entitled;
+        if (served == vesting_duration_ms) {
+            tranche.claimed = true;
+        };
+        delta
+    } else {
+        0
+    };
+
+    let gate_open = tranche.gate_open;
+    let gate_opened_at_ms = tranche.gate_opened_at_ms;
+    let released = tranche.locked.split(releasable);
+
+    // Emitted for every non-zero release, exactly as the TIME path does, so
+    // `TrancheUnlockedEvent` remains the ONE event to sum for creator tranche
+    // payouts regardless of lock kind. `migration::TvlTrancheClaimedEvent`
+    // adds the gate and price context on top; it does not replace this.
+    if (releasable > 0) {
+        event::emit(TrancheUnlockedEvent<Base, Quote> {
+            pool_id,
+            index,
+            amount: releasable,
+            creator,
+        });
+    };
+    (released, creator, gate_open, gate_opened_at_ms)
+}
+
+/// Returns `(total_locked, gate_open, gate_opened_at_ms, vesting_duration_ms,
+/// withdrawn)` for a TVL tranche, so a frontend can render release progress.
+///
+/// TVL-only: the gate and `withdrawn` fields are never written for a TIME
+/// tranche, so reporting them would render a fully-paid TIME tranche as
+/// "nothing released, gate still shut". Use `tranche_info` for those.
+public fun tranche_vesting<Base, Quote>(
+    pool: &Pool<Base, Quote>,
+    index: u64,
+): (u64, bool, u64, u64, u64) {
+    assert!(index < pool.tranches.length(), ETrancheNotFound);
+    let tranche = &pool.tranches[index];
+    assert!(tranche.kind == LOCK_KIND_TVL, ETrancheLocked);
+    (
+        tranche.total_locked,
+        tranche.gate_open,
+        tranche.gate_opened_at_ms,
+        pool.tvl_vesting_duration_ms,
+        tranche.withdrawn,
+    )
+}
+
+public fun tvl_vesting_duration_ms<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
+    pool.tvl_vesting_duration_ms
 }
 
 public(package) fun tranche_tvl_target<Base, Quote>(
