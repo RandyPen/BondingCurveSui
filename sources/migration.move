@@ -35,6 +35,13 @@ use bondingcurvesui::pool::{Self, Pool};
 const EWrongCetusPool: u64 = 1;
 /// The passed Cetus pool orientation does not match the entry point.
 const EWrongOrientation: u64 = 2;
+/// Seed sqrt price is not clear of the full-range endpoints.
+const ESeedPriceOutOfEnvelope: u64 = 3;
+
+/// Margin the seed sqrt price must keep from either full-range endpoint.
+/// Matches `specs::cetus_model_specs::ENDPOINT_GUARD`; see the assert in
+/// `migrate_core` for why it is checked rather than assumed.
+const ENVELOPE_GUARD: u128 = 0x1_0000_0000; // 2^32
 
 // === Events ===
 
@@ -203,8 +210,29 @@ fun migrate_core<Base, Quote>(
     // Cetus ignores the current-tick argument (`_current_tick_index`), so this
     // derivation is redundant today. Passed anyway rather than `i32::zero()`:
     // if a future pinned Cetus rev starts reading it, a real tick stays
-    // correct where a zero would silently be wrong. `sqrt_price` is provably
-    // inside the full range, so the extra bounds assert cannot fire.
+    // correct where a zero would silently be wrong.
+    //
+    // The envelope is CHECKED here rather than argued. The seeding proof
+    // (`specs::cetus_model_specs::binding_leg_fallback_is_safe`) takes it as
+    // a precondition: the seed price must clear both full-range endpoints by
+    // ENVELOPE_GUARD, which is also exactly the condition under which Cetus's
+    // own u128 liquidity and `checked_shlw` do not abort. It holds by a wide
+    // margin under the `config` launch floors -- roughly 1000x at the lower
+    // endpoint -- but that argument lives a file away and rests on
+    // MIN_QUOTE_THRESHOLD and the EReserveOverflow bound. Relaxing either
+    // would silently invalidate the proof's precondition, and the failure
+    // mode is a permanent abort on a COMPLETED pool. So assert it: the abort
+    // is identical either way (Cetus rejects the price too), but it names the
+    // real cause here instead of surfacing from inside the dependency, and
+    // the proof's hypothesis becomes an enforced invariant rather than prose.
+    assert!(
+        sqrt_price > (curve::full_range_lower_sqrt_price() as u128) + ENVELOPE_GUARD,
+        ESeedPriceOutOfEnvelope,
+    );
+    assert!(
+        sqrt_price < (curve::full_range_upper_sqrt_price() as u128) - ENVELOPE_GUARD,
+        ESeedPriceOutOfEnvelope,
+    );
     let (_, need_a, need_b) = clmm_math::get_liquidity_by_amount(
         i32::from_u32(tick_lower),
         i32::from_u32(tick_upper),
