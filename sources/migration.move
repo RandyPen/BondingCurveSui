@@ -9,10 +9,13 @@
 /// because the Cetus pool's type instantiation is fixed in the signature.
 module bondingcurvesui::migration;
 
+use cetus_clmm::clmm_math;
 use cetus_clmm::config::GlobalConfig;
 use cetus_clmm::factory::{Self, Pools};
 use cetus_clmm::pool::{Self as clmm_pool, Pool as CetusPool};
 use cetus_clmm::pool_creator;
+use cetus_clmm::tick_math;
+use integer_mate::i32;
 use cetus_clmm::position::{Self, Position};
 use cetus_clmm::rewarder::RewarderGlobalVault;
 use lp_burn::lp_burn::{Self, BurnManager};
@@ -126,12 +129,9 @@ fun migrate_core<Base, Quote>(
     let (tick_lower, tick_upper) = pool_creator::full_range_tick_range(tick_spacing);
 
     // Migration fee: skimmed from the raised quote before seeding, with
-    // the base leg shrunk by the same ratio (the excess is burned
-    // below). The seed price is computed from the GROSS amounts, i.e.
-    // the curve's final price, so graduation stays gap-free. The CLMM
-    // deposit keeps fixing the (shrunk) base side: the quote it then
-    // requires is at most `quote_net` because the sqrt price is floored
-    // — the same argument that made the pre-fee seeding safe.
+    // the base leg shrunk by the same ratio. The seed price is computed
+    // from the GROSS amounts, i.e. the curve's final price, so graduation
+    // stays gap-free.
     let migration_fee = curve::fee_amount(quote_amount, pool.migration_fee_bps());
     if (migration_fee > 0) {
         sui::balance::send_funds(quote.split(migration_fee), cfg.treasury());
@@ -139,17 +139,70 @@ fun migrate_core<Base, Quote>(
     let quote_net = quote_amount - migration_fee;
     let base_seed =
         ((base_amount as u128) * (quote_net as u128) / (quote_amount as u128)) as u64;
-    let base_excess = base.split(base_amount - base_seed);
 
     // The pool key was reserved at launch (permission pair + creation
     // cap held by the pool), so this cannot be front-run or blocked by a
     // third party creating the pool first.
     let base_is_coin_a = factory::is_right_order<Base, Quote>();
+    let sqrt_price = if (base_is_coin_a) {
+        // A = Base, B = Quote; price = quote per base.
+        curve::initial_sqrt_price_x64(base_amount, quote_amount)
+    } else {
+        // A = Quote, B = Base; price inverted.
+        curve::initial_sqrt_price_x64(quote_amount, base_amount)
+    };
+
+    // Which leg binds the deposit? For a full-range position, seeding a base
+    // leg of `base_seed` costs `(1 - lower/P) / (1 - P/U)` times that leg's
+    // proportional share of quote. That ratio crosses 1 at
+    // `P = sqrt(lower * upper)`, which for every tick spacing is a graduation
+    // price of one RAW quote unit per RAW base unit.
+    //
+    // Below the crossover the base leg binds and fixing it is safe — that is
+    // the historical path. Above it, fixing the base leg would demand more
+    // quote than the fee-shrunk `quote_net` we hold and abort inside Cetus
+    // (`EAmountInAboveMaxLimit`) with NO way to retry: the phase is already
+    // COMPLETED and every input is frozen, so each attempt fails identically
+    // and the whole raise is stranded forever. Flooring the sqrt price buys
+    // only ~1e-19 of relative slack against a ~1e-10 shortfall, so it does
+    // not save us — do not reinstate that argument.
+    //
+    // So ask Cetus's own math which leg binds instead of assuming. Above the
+    // crossover we fix the QUOTE leg, hand the CLMM the whole base balance,
+    // and let the burn below absorb whatever it does not take.
+    // Cetus ignores the current-tick argument (`_current_tick_index`), so this
+    // derivation is redundant today. Passed anyway rather than `i32::zero()`:
+    // if a future pinned Cetus rev starts reading it, a real tick stays
+    // correct where a zero would silently be wrong. `sqrt_price` is provably
+    // inside the full range, so the extra bounds assert cannot fire.
+    let (_, need_a, need_b) = clmm_math::get_liquidity_by_amount(
+        i32::from_u32(tick_lower),
+        i32::from_u32(tick_upper),
+        tick_math::get_tick_at_sqrt_price(sqrt_price),
+        sqrt_price,
+        base_seed,
+        base_is_coin_a,
+    );
+    let need_quote = if (base_is_coin_a) need_b else need_a;
+    let fix_base = need_quote <= quote_net;
+
+    // Fixing the base leg means the CLMM takes exactly `base_seed`, so the
+    // fee's mirror share is split off here and burned. Fixing the quote leg
+    // means the CLMM sizes the base leg itself, so offer it everything —
+    // `base_seed` would be cutting it too fine at the crossover, where the
+    // proportional split leaves no room for Cetus's ceiled rounding.
+    let base_excess = if (fix_base) {
+        base.split(base_amount - base_seed)
+    } else {
+        sui::balance::zero<Base>()
+    };
+
+    // `fix_amount_a` is about the Cetus pool's coin A, not about base/quote:
+    // it agrees with `fix_base` only when the base coin IS coin A.
+    let fix_amount_a = base_is_coin_a == fix_base;
     // The base coin's icon becomes the Position NFT image.
     let position_url = coin_registry::icon_url(currency);
-    let (position, sqrt_price, base_left, quote_left) = if (base_is_coin_a) {
-        // A = Base, B = Quote; price = quote per base.
-        let sqrt_price = curve::initial_sqrt_price_x64(base_amount, quote_amount);
+    let (position, base_left, quote_left) = if (base_is_coin_a) {
         let (position, base_left, quote_left) =
             pool_creator::create_pool_v3_with_creation_cap<Base, Quote>(
                 cetus_config,
@@ -162,14 +215,12 @@ fun migrate_core<Base, Quote>(
                 tick_upper,
                 base.into_coin(ctx),
                 quote.into_coin(ctx),
-                true, // fix the (shrunk) base side
+                fix_amount_a,
                 clock,
                 ctx,
             );
-        (position, sqrt_price, base_left, quote_left)
+        (position, base_left, quote_left)
     } else {
-        // A = Quote, B = Base; price inverted.
-        let sqrt_price = curve::initial_sqrt_price_x64(quote_amount, base_amount);
         let (position, quote_left, base_left) =
             pool_creator::create_pool_v3_with_creation_cap<Quote, Base>(
                 cetus_config,
@@ -182,11 +233,11 @@ fun migrate_core<Base, Quote>(
                 tick_upper,
                 quote.into_coin(ctx),
                 base.into_coin(ctx),
-                false, // still fix the (shrunk) base side (coin B here)
+                fix_amount_a,
                 clock,
                 ctx,
             );
-        (position, sqrt_price, base_left, quote_left)
+        (position, base_left, quote_left)
     };
 
     // The fee's mirror share of base plus any rounding dust is burned

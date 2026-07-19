@@ -645,3 +645,161 @@ fun tvl_unlock_rejects_foreign_cetus_pool() {
     unit_test::destroy(aux_currency);
     end(scenario, clock, cetus_env, currency);
 }
+
+// === Above-crossover seeding (regression) ===
+
+// Launch parameters that put the graduation price ABOVE one raw quote unit
+// per raw base unit (4e14 quote raised against a 1e14 base LP leg => price 4,
+// sqrt price > 2^64). That is the regime where fixing the base leg makes
+// Cetus demand more quote than the fee-shrunk `quote_net` the pool holds:
+// with these numbers the old always-fix-base seeding came up 138549 short and
+// aborted `EAmountInAboveMaxLimit`, stranding the whole raise permanently
+// (the pool is already COMPLETED, so every retry fails identically).
+const HI_INITIAL_BASE: u64 = 400_000_000_000_000;
+const HI_REMAIN_BASE: u64 = 100_000_000_000_000;
+const HI_THRESHOLD: u64 = 400_000_000_000_000;
+
+fun setup_above_crossover(): (Scenario, Clock, mocks::CetusEnv) {
+    let mut scenario = ts::begin(ADMIN);
+    config::init_for_testing(scenario.ctx());
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap,
+            &mut cfg,
+            9,
+            HI_INITIAL_BASE,
+            HI_REMAIN_BASE,
+            200,
+            24 * 60 * 60 * 1000,
+            3,
+            10_000,
+            10_000,
+        );
+        config::add_quote<MOCK_QUOTE>(
+            &admin_cap,
+            &mut cfg,
+            6,
+            HI_THRESHOLD,
+            MIN_THRESHOLD,
+            CREATION_FEE,
+            MIN_BUY,
+            MIN_TVL_TARGET,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    let cetus_env = mocks::new_cetus_env(scenario.ctx());
+    let clock = clock::create_for_testing(scenario.ctx());
+    (scenario, clock, cetus_env)
+}
+
+/// Launches `B` under the above-crossover params and drains the curve.
+fun launch_and_complete_above_crossover<B: drop>(
+    scenario: &mut Scenario,
+    clock: &Clock,
+    cetus_env: &mut mocks::CetusEnv,
+): Currency<B> {
+    scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<B>(scenario.ctx());
+    {
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+        let change = pool::create_token<B, MOCK_QUOTE>(
+            &mut cfg,
+            &mut currency,
+            receipt,
+            mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
+            option::none(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            b"".to_string(),
+            vector[],
+            vector[],
+            vector[],
+            mocks::mint_quote<MOCK_QUOTE>(100_000_000, scenario.ctx()),
+            cetus_config,
+            cetus_pools,
+            clock,
+            scenario.ctx(),
+        );
+        transfer::public_transfer(change, CREATOR);
+        ts::return_shared(cfg);
+    };
+    scenario.next_tx(TRADER);
+    {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
+        // Comfortably over the 4e14 raise plus the 1% curve fee; the
+        // completing buy refunds the rest.
+        let (base, change) = pool::buy(
+            &cfg,
+            &mut pool,
+            mocks::mint_quote<MOCK_QUOTE>(500_000_000_000_000, scenario.ctx()),
+            0,
+            option::none(),
+            clock,
+            scenario.ctx(),
+        );
+        transfer::public_transfer(base, TRADER);
+        transfer::public_transfer(change, TRADER);
+        assert!(pool.phase() == pool::phase_completed());
+        ts::return_shared(cfg);
+        ts::return_shared(pool);
+    };
+    currency
+}
+
+fun assert_migrates_above_crossover<B: drop>() {
+    let (mut scenario, clock, mut cetus_env) = setup_above_crossover();
+    let mut currency =
+        launch_and_complete_above_crossover<B>(&mut scenario, &clock, &mut cetus_env);
+    scenario.next_tx(TRADER);
+    let cfg = scenario.take_shared<LaunchpadConfig>();
+    let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
+    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+    // Under the old always-fix-base seeding this call aborted.
+    let position = migration::migrate_for_testing(
+        &cfg,
+        &mut pool,
+        &mut currency,
+        cetus_config,
+        cetus_pools,
+        &clock,
+        scenario.ctx(),
+    );
+    let events = sui::event::events_by_type<migration::MigratedEvent<B, MOCK_QUOTE>>();
+    assert!(events.length() == 1);
+    let (_, _, base_burned, sqrt_price) = migration::migrated_event_amounts(&events[0]);
+    // Documents the regime under test. The crossover sits at a pool sqrt price
+    // of 2^64; the base leg stops binding on the side where base is the
+    // richer coin, which is ABOVE 2^64 when base is coin A and BELOW it when
+    // base is coin B (the pool price is then quoted the other way round).
+    let base_is_coin_a = pool.base_is_coin_a().destroy_some();
+    if (base_is_coin_a) {
+        assert!(sqrt_price > 18_446_744_073_709_551_616);
+    } else {
+        assert!(sqrt_price < 18_446_744_073_709_551_616);
+    };
+    // Fixing the quote leg lets Cetus size the base leg, so the unabsorbed
+    // base (the fee's mirror share plus rounding) is burned.
+    assert!(base_burned > 0);
+    assert!(pool.phase() == pool::phase_migrated());
+    ts::return_shared(cfg);
+    ts::return_shared(pool);
+    unit_test::destroy(position);
+    end(scenario, clock, cetus_env, currency);
+}
+
+#[test]
+fun migrates_above_crossover_base_is_coin_a() {
+    assert_migrates_above_crossover<ZZZ_BASE>();
+}
+
+#[test]
+fun migrates_above_crossover_base_is_coin_b() {
+    assert_migrates_above_crossover<AAA_BASE>();
+}
