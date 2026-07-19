@@ -180,7 +180,7 @@ fun init(ctx: &mut TxContext) {
         curve_fee_platform_bps: 6_000, // 60% platform / 40% creator
         referral_bps: 1_000, // 10% to the referrer, out of the platform's 60%
         lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
-        migration_fee_bps: 200, // 2% of the raise, at graduation
+        migration_fee_bps: 100, // 1% of the raise, at graduation
         tick_spacing: 200, // Cetus 1% fee tier
         min_lock_duration_ms: 24 * 60 * 60 * 1000, // 24 hours
         tvl_target_multiplier: 3,
@@ -520,7 +520,7 @@ public fun init_for_testing(ctx: &mut TxContext) {
         curve_fee_platform_bps: 6_000,
         referral_bps: 1_000,
         lp_fee_platform_bps: 5_000,
-        migration_fee_bps: 200,
+        migration_fee_bps: 100,
         tick_spacing: 200,
         min_lock_duration_ms: 24 * 60 * 60 * 1000,
         tvl_target_multiplier: 3,
