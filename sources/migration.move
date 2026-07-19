@@ -75,7 +75,6 @@ public struct LpFeesClaimedEvent<phantom Base, phantom Quote> has copy, drop {
 /// holders the whole schedule to react to it.
 public struct TvlTrancheClaimedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
-    index: u64,
     /// Circulating supply (from the Currency) x CLMM price, in quote.
     market_cap_in_quote: u128,
     tvl_target: u64,
@@ -429,10 +428,9 @@ entry fun claim_tranche_tvl<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
-    index: u64,
     clock: &Clock,
 ) {
-    do_claim_tranche_tvl(cfg, pool, cetus_pool, currency, index, clock)
+    do_claim_tranche_tvl(cfg, pool, cetus_pool, currency, clock)
 }
 
 public(package) fun do_claim_tranche_tvl<Base, Quote>(
@@ -440,7 +438,6 @@ public(package) fun do_claim_tranche_tvl<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Base, Quote>,
     currency: &Currency<Base>,
-    index: u64,
     clock: &Clock,
 ) {
     claim_tranche_tvl_internal(
@@ -450,7 +447,6 @@ public(package) fun do_claim_tranche_tvl<Base, Quote>(
         currency,
         clmm_pool::current_sqrt_price(cetus_pool),
         true,
-        index,
         clock,
     );
 }
@@ -461,10 +457,9 @@ entry fun claim_tranche_tvl_inverted<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
-    index: u64,
     clock: &Clock,
 ) {
-    do_claim_tranche_tvl_inverted(cfg, pool, cetus_pool, currency, index, clock)
+    do_claim_tranche_tvl_inverted(cfg, pool, cetus_pool, currency, clock)
 }
 
 public(package) fun do_claim_tranche_tvl_inverted<Base, Quote>(
@@ -472,7 +467,6 @@ public(package) fun do_claim_tranche_tvl_inverted<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     cetus_pool: &CetusPool<Quote, Base>,
     currency: &Currency<Base>,
-    index: u64,
     clock: &Clock,
 ) {
     claim_tranche_tvl_internal(
@@ -482,7 +476,6 @@ public(package) fun do_claim_tranche_tvl_inverted<Base, Quote>(
         currency,
         clmm_pool::current_sqrt_price(cetus_pool),
         false,
-        index,
         clock,
     );
 }
@@ -494,7 +487,6 @@ fun claim_tranche_tvl_internal<Base, Quote>(
     currency: &Currency<Base>,
     sqrt_price_x64: u128,
     base_is_coin_a: bool,
-    index: u64,
     clock: &Clock,
 ) {
     cfg.assert_version();
@@ -510,18 +502,17 @@ fun claim_tranche_tvl_internal<Base, Quote>(
     let total_supply = coin_registry::total_supply(currency).destroy_some();
     let market_cap =
         curve::tvl_in_quote(total_supply, 0, sqrt_price_x64, base_is_coin_a);
-    let target = pool::tvl_tranche_target(pool, index);
+    let target = pool::tvl_tranche_target(pool);
     // Below target is NOT an error. Once the gate is open the price is
     // irrelevant, and before it opens a failed observation is just a no-op —
     // aborting would make routine claim calls fail for no reason.
     let qualified = market_cap >= (target as u128);
 
     let (released, creator, gate_open, gate_opened_at_ms) =
-        pool::claim_tvl_tranche(pool, index, qualified, clock.timestamp_ms());
+        pool::claim_tvl_tranche(pool, qualified, clock.timestamp_ms());
     let amount = released.value();
     event::emit(TvlTrancheClaimedEvent<Base, Quote> {
         pool_id: object::id(pool),
-        index,
         market_cap_in_quote: market_cap,
         tvl_target: target,
         qualified,

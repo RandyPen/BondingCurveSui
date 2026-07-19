@@ -189,7 +189,7 @@ fun create_token_initializes_pool() {
         assert!((vq as u128) == (THRESHOLD as u128) * (R as u128) / ((I - R) as u128));
         let (base, lp_base, quote) = pool.real_reserves();
         assert!(base == I && lp_base == R && quote == 0);
-        assert!(pool.time_tranche_count() == 0 && pool.tvl_tranche_count() == 0);
+        assert!(!pool.time_tranche_exists() && !pool.tvl_tranche_exists());
         ts::return_shared(pool);
     };
 
@@ -216,12 +216,13 @@ fun create_token_with_tranches_locks_first_buys() {
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        // One of each kind, each at index 0 of its own vector.
-        assert!(pool.time_tranche_count() == 1 && pool.tvl_tranche_count() == 1);
-        let (ts0, locked0, claimed0) = pool.time_tranche_info(0);
+        // One of each kind, each its own singleton field.
+        assert!(pool.time_tranche_exists());
+        assert!(pool.tvl_tranche_exists());
+        let (ts0, locked0, claimed0) = pool.time_tranche_info();
         assert!(ts0 == 1_000_000 + MIN_LOCK_MS);
         assert!(locked0 > 0 && !claimed0);
-        let (tvl1, locked1, claimed1) = pool.tvl_tranche_info(0);
+        let (tvl1, locked1, claimed1) = pool.tvl_tranche_info();
         assert!(tvl1 == 50_000_000_000);
         assert!(locked1 > 0 && !claimed1);
         // Second tranche bought at a worse price than the first.
@@ -551,7 +552,7 @@ fun creator_tranches_can_drain_whole_curve() {
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         assert!(pool.phase() == pool::phase_completed());
-        let (_, locked, _) = pool.time_tranche_info(0);
+        let (_, locked, _) = pool.time_tranche_info();
         assert!(locked == I); // creator locked the whole sellable supply
         ts::return_shared(pool);
     };
@@ -649,8 +650,8 @@ fun time_tranche_unlocks_at_boundary() {
     {
         let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
-        let (_, locked, claimed) = pool.time_tranche_info(0);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
+        let (_, locked, claimed) = pool.time_tranche_info();
         assert!(locked == 0 && claimed);
         ts::return_shared(cfg);
         ts::return_shared(pool);
@@ -682,7 +683,7 @@ fun time_tranche_locked_before_boundary() {
     {
         let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
     };
@@ -706,8 +707,8 @@ fun tranche_cannot_be_claimed_twice() {
     {
         let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
     };
@@ -978,7 +979,7 @@ fun tranche_unlock_pays_new_creator_after_transfer() {
     {
         let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
         // A tranche locked before the transfer pays the new creator.
@@ -1083,10 +1084,9 @@ fun non_creator_cannot_update_metadata() {
 
 #[test, expected_failure(abort_code = pool::ETrancheNotFound)]
 /// The time-unlock entry cannot reach a TVL tranche. Note the error: it is
-/// ETrancheNotFound, not a kind mismatch. Since the split there is no shared
-/// index space to confuse -- `unlock_tranche_time` indexes `time_tranches`,
-/// and a launch with only a TVL tranche has none. "Wrong kind" stopped being
-/// a runtime category and became a fact about which vector an index names.
+/// ETrancheNotFound, not a kind mismatch. `unlock_tranche_time` addresses the
+/// TimeTrancheKey singleton, and a launch with only a TVL tranche has none, so
+/// "wrong kind" stopped being a runtime category and became a typed absence.
 fun time_unlock_cannot_reach_a_tvl_tranche() {
     let (mut scenario, mut clock) = setup();
     clock.set_for_testing(1_000);
@@ -1103,7 +1103,7 @@ fun time_unlock_cannot_reach_a_tvl_tranche() {
     {
         let cfg = scenario.take_shared<LaunchpadConfig>();
         let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        pool::unlock_tranche_time(&cfg, &mut pool, 0, &clock);
+        pool::unlock_tranche_time(&cfg, &mut pool, &clock);
         ts::return_shared(cfg);
         ts::return_shared(pool);
     };

@@ -151,7 +151,7 @@ fun create_rejects_too_many_tranches() {
     let mut kinds = vector[];
     let mut params = vector[];
     let mut i = 0u64;
-    while (i < 17) {
+    while (i < 3) {
         quote_in.push_back(1_000_000);
         kinds.push_back(pool::lock_kind_time());
         params.push_back(1_000 + MIN_LOCK_MS);
@@ -268,7 +268,7 @@ fun oversized_first_buy_clamps_to_cap() {
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let (_, locked, _) = pool.time_tranche_info(0);
+        let (_, locked, _) = pool.time_tranche_info();
         assert!(locked == MAX_TIME_BASE); // exactly 3% of supply
         ts::return_shared(pool);
     };
@@ -764,9 +764,10 @@ fun first_buy_caps_are_independent_and_stack() {
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         // Each kind fills its own budget, in its own vector.
-        assert!(pool.time_tranche_count() == 1 && pool.tvl_tranche_count() == 1);
-        let (_, locked0, _) = pool.time_tranche_info(0);
-        let (_, locked1, _) = pool.tvl_tranche_info(0);
+        assert!(pool.time_tranche_exists());
+        assert!(pool.tvl_tranche_exists());
+        let (_, locked0, _) = pool.time_tranche_info();
+        let (_, locked1, _) = pool.tvl_tranche_info();
         assert!(locked0 == MAX_TIME_BASE);
         assert!(locked1 == MAX_TVL_BASE);
         ts::return_shared(pool);
@@ -775,74 +776,43 @@ fun first_buy_caps_are_independent_and_stack() {
     scenario.end();
 }
 
-#[test]
-/// Once a lock kind's cap is exhausted, later tranches of that kind lock
-/// nothing. They must be SKIPPED rather than recorded as zero-value
-/// tranches, and their quote fully refunded — otherwise the on-chain tranche
-/// indices would not match the ones unlock calls use.
-fun exhausted_cap_skips_later_tranches() {
-    let (mut scenario, clock) = setup_with_caps();
-    let unlock_at = 1_000_000 + MIN_LOCK_MS;
-    let change = create_returning_change(
-        &mut scenario,
-        &clock,
-        vector[OVERSIZED_BUY, OVERSIZED_BUY, OVERSIZED_BUY],
-        vector[pool::lock_kind_time(), pool::lock_kind_time(), pool::lock_kind_time()],
-        vector[unlock_at, unlock_at, unlock_at],
-        3 * OVERSIZED_BUY,
-    );
-    // Tranches 2 and 3 bought nothing, so their quote is returned untouched.
-    assert!(change >= 2 * OVERSIZED_BUY);
-
-    scenario.next_tx(CREATOR);
-    {
-        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        // One recorded tranche, not three.
-        assert!(pool.time_tranche_count() == 1);
-        let (_, locked, _) = pool.time_tranche_info(0);
-        assert!(locked == MAX_TIME_BASE);
-        ts::return_shared(pool);
-    };
-    clock.destroy_for_testing();
-    scenario.end();
-}
-
-#[test]
-/// Per-kind vectors mean a skipped tranche of one kind cannot move the other
-/// kind's indices. Before the split, the two shared one vector, so the TVL
-/// tranche below landed at index 1 -- one position off its input slot,
-/// because the second TIME buy found its cap exhausted and was dropped.
-/// Now it is at TVL index 0 and the skip is invisible to it.
+#[test, expected_failure(abort_code = pool::ETooManyTranches)]
+/// A pool holds at most ONE time tranche. Two in the same launch is rejected
+/// outright rather than merged or silently dropped — the singleton dynamic
+/// field is the whole record, so a second one has nowhere to go.
 ///
-/// The compaction WITHIN a kind still happens: three TIME buys against an
-/// exhausted cap still collapse to one entry (see
-/// `exhausted_cap_skips_later_tranches`). Splitting bounds the blast radius
-/// of a skip to its own kind; it does not remove skips.
-fun skip_in_one_kind_does_not_shift_the_other() {
+/// The vector is length 2, so `MAX_TRANCHES` is satisfied and the per-kind
+/// uniqueness assert is what fires (`create_rejects_too_many_tranches`
+/// covers the length bound separately).
+fun create_rejects_two_time_tranches() {
     let (mut scenario, clock) = setup_with_caps();
     let unlock_at = 1_000_000 + MIN_LOCK_MS;
     create_returning_change(
         &mut scenario,
         &clock,
-        vector[OVERSIZED_BUY, OVERSIZED_BUY, OVERSIZED_BUY],
-        // Input 1 exhausts the TIME cap and is dropped; input 2 is a TVL
-        // tranche with its own untouched budget.
-        vector[pool::lock_kind_time(), pool::lock_kind_time(), pool::lock_kind_tvl()],
-        vector[unlock_at, unlock_at, 50_000_000_000],
-        3 * OVERSIZED_BUY,
+        vector[OVERSIZED_BUY, OVERSIZED_BUY],
+        vector[pool::lock_kind_time(), pool::lock_kind_time()],
+        vector[unlock_at, unlock_at],
+        2 * OVERSIZED_BUY,
     );
-    scenario.next_tx(CREATOR);
-    {
-        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        assert!(pool.time_tranche_count() == 1);
-        assert!(pool.tvl_tranche_count() == 1);
-        let (_, time_locked, _) = pool.time_tranche_info(0);
-        // Input index 2, TVL index 0: the dropped TIME tranche did not move it.
-        let (_, tvl_locked, _) = pool.tvl_tranche_info(0);
-        assert!(time_locked == MAX_TIME_BASE);
-        assert!(tvl_locked == MAX_TVL_BASE);
-        ts::return_shared(pool);
-    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = pool::ETooManyTranches)]
+/// Uniqueness is enforced per kind, not just for TIME: a second TVL tranche
+/// is rejected the same way. `first_buy_caps_are_independent_and_stack`
+/// covers the allowed combination (one of each).
+fun create_rejects_two_tvl_tranches() {
+    let (mut scenario, clock) = setup_with_caps();
+    create_returning_change(
+        &mut scenario,
+        &clock,
+        vector[OVERSIZED_BUY, OVERSIZED_BUY],
+        vector[pool::lock_kind_tvl(), pool::lock_kind_tvl()],
+        vector[50_000_000_000, 50_000_000_000],
+        2 * OVERSIZED_BUY,
+    );
     clock.destroy_for_testing();
     scenario.end();
 }
