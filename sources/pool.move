@@ -19,6 +19,7 @@ use sui::balance::{Self, Balance};
 use sui::clock::Clock;
 use sui::coin::{Self, Coin, TreasuryCap};
 use sui::coin_registry::{Self, Currency, MetadataCap};
+use sui::dynamic_field as df;
 use sui::dynamic_object_field as dof;
 use sui::event;
 
@@ -111,6 +112,21 @@ const STD_BASE_DECIMALS: u8 = 9;
 
 /// Dynamic-object-field key for the MetadataCap held by the pool.
 public struct MetadataCapKey has copy, drop, store {}
+
+// Dynamic-field keys for creator tranches, one namespace per lock kind.
+//
+// Tranches live in dynamic fields rather than inline vectors because the
+// trade path never reads them: `buy` and `sell` load and write the whole
+// shared `Pool` on every call, so up to 16 tranches (each holding a Balance)
+// would be serialized on every trade forever, for data those calls never
+// touch. Dynamic fields are loaded only when addressed. Same reasoning as the
+// MetadataCap above.
+//
+// Indices are dense (0 .. count-1) and assigned at launch; nothing is ever
+// removed, so they are stable for the pool's lifetime.
+public struct TimeTrancheKey has copy, drop, store { index: u64 }
+
+public struct TvlTrancheKey has copy, drop, store { index: u64 }
 
 /// Provenance proof produced by `seal` and consumed by `create_token`.
 ///
@@ -219,16 +235,17 @@ public struct Pool<phantom Base, phantom Quote> has key {
     tvl_vesting_duration_ms: u64,
     /// Project description and social links; creator-updatable.
     project: ProjectInfo,
-    // Creator first-buy tranches, one vector per lock kind. Split so that
-    // passing a TVL tranche to the time path (or the reverse) is not
-    // expressible rather than merely asserted, and so neither kind carries
-    // the other's fields.
+    // Creator first-buy tranches live in dynamic fields keyed by
+    // `TimeTrancheKey` / `TvlTrancheKey`; only their counts are inline. Split
+    // per lock kind so that passing a TVL tranche to the time path (or the
+    // reverse) is not expressible rather than merely asserted, and so neither
+    // kind carries the other's fields.
     //
-    // Consequence for clients: tranche indices are PER KIND. The event TYPE
-    // says which vector an index addresses -- `TimeTranche*` events index
-    // `time_tranches`, `TvlTranche*` events index `tvl_tranches`.
-    time_tranches: vector<TimeTranche<Base>>,
-    tvl_tranches: vector<TvlTranche<Base>>,
+    // Consequence for clients: tranche indices are PER KIND, and reading a
+    // tranche is a dynamic-field lookup rather than a field of the pool. The
+    // event TYPE says which namespace an index addresses.
+    time_tranche_count: u64,
+    tvl_tranche_count: u64,
     /// Reserves the (Base, Quote, tick_spacing) Cetus pool key at launch
     /// so nobody can front-run the migration's pool creation.
     pool_creation_cap: PoolCreationCap,
@@ -544,8 +561,8 @@ public fun create_token<Base, Quote>(
         min_buy_amount: quote_params.quote_min_buy_amount(),
         tvl_vesting_duration_ms: cfg.tvl_vesting_duration_ms(),
         project: new_project_info(description, twitter, telegram, website),
-        time_tranches: vector[],
-        tvl_tranches: vector[],
+        time_tranche_count: 0,
+        tvl_tranche_count: 0,
         pool_creation_cap,
         completed_at_ms: 0,
         cetus_pool_id: option::none(),
@@ -719,11 +736,13 @@ fun execute_tranche_buys<Base, Quote>(
             // not the input-vector index — skipped no-ops shift them apart.
             let pool_id = pool.id.to_inner();
             if (kind == LOCK_KIND_TIME) {
-                let index = pool.time_tranches.length();
-                pool.time_tranches.push_back(TimeTranche {
-                    locked: base_out,
-                    unlock_ts_ms: param,
-                });
+                let index = pool.time_tranche_count;
+                pool.time_tranche_count = index + 1;
+                df::add(
+                    &mut pool.id,
+                    TimeTrancheKey { index },
+                    TimeTranche { locked: base_out, unlock_ts_ms: param },
+                );
                 event::emit(TimeTrancheLockedEvent<Base, Quote> {
                     pool_id,
                     index,
@@ -732,15 +751,20 @@ fun execute_tranche_buys<Base, Quote>(
                     base_locked,
                 });
             } else {
-                let index = pool.tvl_tranches.length();
-                pool.tvl_tranches.push_back(TvlTranche {
-                    locked: base_out,
-                    total_locked: base_locked,
-                    tvl_target: param,
-                    gate_opened_at_ms: 0,
-                    gate_open: false,
-                    withdrawn: 0,
-                });
+                let index = pool.tvl_tranche_count;
+                pool.tvl_tranche_count = index + 1;
+                df::add(
+                    &mut pool.id,
+                    TvlTrancheKey { index },
+                    TvlTranche {
+                        locked: base_out,
+                        total_locked: base_locked,
+                        tvl_target: param,
+                        gate_opened_at_ms: 0,
+                        gate_open: false,
+                        withdrawn: 0,
+                    },
+                );
                 event::emit(TvlTrancheLockedEvent<Base, Quote> {
                     pool_id,
                     index,
@@ -1006,8 +1030,9 @@ public fun unlock_tranche_time<Base, Quote>(
     let now = clock.timestamp_ms();
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
-    assert!(index < pool.time_tranches.length(), ETrancheNotFound);
-    let tranche = &mut pool.time_tranches[index];
+    assert!(index < pool.time_tranche_count, ETrancheNotFound);
+    let tranche: &mut TimeTranche<Base> =
+        df::borrow_mut(&mut pool.id, TimeTrancheKey { index });
     assert!(now >= tranche.unlock_ts_ms, ETrancheLocked);
     // A recorded tranche is never zero-valued, so an empty balance means it
     // has already been drained. That is the `claimed` flag, without the flag.
@@ -1214,11 +1239,11 @@ public fun real_reserves<Base, Quote>(pool: &Pool<Base, Quote>): (u64, u64, u64)
 // the pool. Sum `CurveFeesPaidEvent` for per-pool fee totals.
 
 public fun time_tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
-    pool.time_tranches.length()
+    pool.time_tranche_count
 }
 
 public fun tvl_tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
-    pool.tvl_tranches.length()
+    pool.tvl_tranche_count
 }
 
 /// Returns `(unlock_ts_ms, locked_amount, claimed)`.
@@ -1226,8 +1251,8 @@ public fun time_tranche_info<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): (u64, u64, bool) {
-    assert!(index < pool.time_tranches.length(), ETrancheNotFound);
-    let tranche = &pool.time_tranches[index];
+    assert!(index < pool.time_tranche_count, ETrancheNotFound);
+    let tranche: &TimeTranche<Base> = df::borrow(&pool.id, TimeTrancheKey { index });
     (tranche.unlock_ts_ms, tranche.locked.value(), tranche.locked.value() == 0)
 }
 
@@ -1236,8 +1261,8 @@ public fun tvl_tranche_info<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): (u64, u64, bool) {
-    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
-    let tranche = &pool.tvl_tranches[index];
+    assert!(index < pool.tvl_tranche_count, ETrancheNotFound);
+    let tranche: &TvlTranche<Base> = df::borrow(&pool.id, TvlTrancheKey { index });
     (
         tranche.tvl_target,
         tranche.locked.value(),
@@ -1355,8 +1380,9 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
     let vesting_duration_ms = pool.tvl_vesting_duration_ms;
-    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
-    let tranche = &mut pool.tvl_tranches[index];
+    assert!(index < pool.tvl_tranche_count, ETrancheNotFound);
+    let tranche: &mut TvlTranche<Base> =
+        df::borrow_mut(&mut pool.id, TvlTrancheKey { index });
     // Deliberately no completion assert: once the window completes the
     // arithmetic below yields a zero delta on its own, so a keeper polling
     // every pool keeps getting harmless no-ops instead of permanent aborts.
@@ -1411,8 +1437,8 @@ public fun tvl_tranche_vesting<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): (u64, bool, u64, u64, u64) {
-    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
-    let tranche = &pool.tvl_tranches[index];
+    assert!(index < pool.tvl_tranche_count, ETrancheNotFound);
+    let tranche: &TvlTranche<Base> = df::borrow(&pool.id, TvlTrancheKey { index });
     (
         tranche.total_locked,
         tranche.gate_open,
@@ -1430,8 +1456,9 @@ public(package) fun tvl_tranche_target<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): u64 {
-    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
-    pool.tvl_tranches[index].tvl_target
+    assert!(index < pool.tvl_tranche_count, ETrancheNotFound);
+    let tranche: &TvlTranche<Base> = df::borrow(&pool.id, TvlTrancheKey { index });
+    tranche.tvl_target
 }
 
 
