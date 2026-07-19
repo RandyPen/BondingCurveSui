@@ -169,8 +169,7 @@ fun migrate_core<Base, Quote>(
         sui::balance::send_funds(quote.split(migration_fee), cfg.treasury());
     };
     let quote_net = quote_amount - migration_fee;
-    let base_seed =
-        ((base_amount as u128) * (quote_net as u128) / (quote_amount as u128)) as u64;
+    let base_seed = curve::seed_base_amount(base_amount, quote_net, quote_amount);
 
     // The pool key was reserved at launch (permission pair + creation
     // cap held by the pool), so this cannot be front-run or blocked by a

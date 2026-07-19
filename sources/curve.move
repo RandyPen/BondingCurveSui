@@ -32,6 +32,8 @@ const EExcessiveOutput: u64 = 4;
 const EInvariantViolation: u64 = 5;
 /// sqrt price computation received a zero amount.
 const EZeroAmount: u64 = 6;
+/// Vesting schedule has a zero duration.
+const EZeroDuration: u64 = 7;
 
 const BPS_DENOMINATOR: u64 = 10_000;
 const U64_MAX: u128 = 0xffff_ffff_ffff_ffff;
@@ -109,6 +111,39 @@ public fun sell_out(vb: u64, vq: u64, base_in: u64): (u64, u64, u64) {
 /// Ceiled fee on `amount` at `bps` basis points.
 public fun fee_amount(amount: u64, bps: u64): u64 {
     (div_ceil((amount as u128) * (bps as u128), BPS_DENOMINATOR as u128) as u64)
+}
+
+// === Linear release ===
+
+/// Amount released by a linear schedule after `served_ms` of its
+/// `duration_ms` have elapsed. Floored, so the remainder stays locked until
+/// the schedule completes, where the ratio is exactly 1.
+///
+/// Pure and separated from the tranche bookkeeping so the two properties the
+/// bookkeeping relies on can be proven rather than argued: the result never
+/// exceeds `total`, and it reaches exactly `total` at completion — otherwise
+/// a tranche would either over-release or strand dust forever.
+public fun vested_amount(total: u64, served_ms: u64, duration_ms: u64): u64 {
+    assert!(duration_ms > 0, EZeroDuration);
+    let served = if (served_ms > duration_ms) duration_ms else served_ms;
+    // u64 * u64 always fits u128: (2^64-1)^2 = 2^128 - 2^65 + 1 < 2^128 - 1.
+    (((total as u128) * (served as u128) / (duration_ms as u128)) as u64)
+}
+
+// === Migration seeding ===
+
+/// Base leg handed to the CLMM: `base_amount` shrunk by the same ratio the
+/// migration fee shrinks the quote leg, so both legs scale together and the
+/// seed price is unchanged. Floored.
+///
+/// A zero result is catastrophic rather than merely wrong — the coin handed
+/// to Cetus would be empty, `add_liquidity_fix_coin` would abort, and since
+/// migration cannot be paused and a COMPLETED pool cannot sell, the raise
+/// would be stranded permanently. `seed_base_never_degenerates` proves the
+/// launch-time floors in `config` make that unreachable.
+public fun seed_base_amount(base_amount: u64, quote_net: u64, quote_amount: u64): u64 {
+    assert!(quote_amount > 0, EZeroAmount);
+    (((base_amount as u128) * (quote_net as u128) / (quote_amount as u128)) as u64)
 }
 
 // === CLMM price / TVL math ===

@@ -1299,15 +1299,17 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
     let releasable = if (tranche.gate_open) {
         // Sui's Clock is monotonic, so this cannot underflow.
         let elapsed = now_ms - tranche.gate_opened_at_ms;
-        let served = if (elapsed > vesting_duration_ms) vesting_duration_ms else elapsed;
-        // Floored, like every other rounding here: the remainder stays locked
-        // until the window completes, where the ratio is exactly 1 and the
-        // balance drains to zero with nothing stranded.
-        let entitled = (((tranche.total_locked as u128) * (served as u128)
-            / (vesting_duration_ms as u128)) as u64);
+        // `curve::vested_amount` clamps and floors; its spec proves the two
+        // properties this bookkeeping depends on (never exceeds `total_locked`,
+        // reaches it exactly at completion).
+        let entitled = curve::vested_amount(
+            tranche.total_locked,
+            elapsed,
+            vesting_duration_ms,
+        );
         let delta = entitled - tranche.withdrawn;
         tranche.withdrawn = entitled;
-        if (served == vesting_duration_ms) {
+        if (elapsed >= vesting_duration_ms) {
             tranche.claimed = true;
         };
         delta
