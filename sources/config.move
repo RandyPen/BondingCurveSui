@@ -57,6 +57,14 @@ const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
 ///     exceeds MAX_INITIAL_TO_REMAIN_RATIO squared.
 /// Rejecting the config is recoverable; aborting the migration is not.
 const MIN_REMAIN_BASE: u64 = 1_000_000_000;
+/// The platform's only Cetus fee tier: tick spacing 200 (the 1% tier).
+/// Pinned rather than left free because the full-range tick bounds — and
+/// therefore the sqrt-price window the migration seeds into — follow from it.
+/// The formal proof of the seeding math is stated over the sqrt prices of
+/// THIS tier's full range as literals, which is what lets it avoid reasoning
+/// about `tick_math::get_sqrt_price_at_tick`. Allowing another spacing would
+/// silently move the code outside what is proven.
+const PLATFORM_TICK_SPACING: u32 = 200;
 /// Floor on a quote's `min_threshold`, for the same reason: a raise of 1 raw
 /// unit makes the ceiled migration fee consume it whole (`quote_net == 0`),
 /// which floors `base_seed` to 0 and bricks migration exactly as above.
@@ -341,6 +349,8 @@ public fun set_launch_params(
     // Base decimals are locked at the platform standard: `pool::seal` hard-codes
     // 9, so any other value would abort every future launch (EDecimalsMismatch).
     assert!(base_decimals == 9, EInvalidLaunchParams);
+    // Locked to the platform's single fee tier; see PLATFORM_TICK_SPACING.
+    assert!(tick_spacing == PLATFORM_TICK_SPACING, EInvalidLaunchParams);
     // Keep the curve/migration inside Cetus's price envelope: an extreme
     // initial/remain ratio can push the CLMM seed sqrt price out of the
     // representable range and permanently block migration.

@@ -987,3 +987,22 @@ fun repeated_claims_do_not_release_more_than_schedule() {
     };
     end(scenario, clock, cetus_env, currency);
 }
+
+#[test]
+/// Bridges the formal proofs to reality. The seeding specs are stated over
+/// the platform tier's full-range sqrt prices as LITERALS, so that they need
+/// not reason about `tick_math::get_sqrt_price_at_tick`. This asserts those
+/// literals are what Cetus actually computes for the pinned tick spacing --
+/// a dependency bump that moved them must fail here rather than silently
+/// invalidate the proofs.
+fun full_range_sqrt_prices_match_cetus() {
+    let (lower_tick, upper_tick) = cetus_clmm::pool_creator::full_range_tick_range(200);
+    let lo = cetus_clmm::tick_math::get_sqrt_price_at_tick(
+        integer_mate::i32::from_u32(lower_tick),
+    );
+    let up = cetus_clmm::tick_math::get_sqrt_price_at_tick(
+        integer_mate::i32::from_u32(upper_tick),
+    );
+    assert!(lo == curve::full_range_lower_sqrt_price());
+    assert!(up == curve::full_range_upper_sqrt_price());
+}

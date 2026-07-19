@@ -113,6 +113,23 @@ public fun fee_amount(amount: u64, bps: u64): u64 {
     (div_ceil((amount as u128) * (bps as u128), BPS_DENOMINATOR as u128) as u64)
 }
 
+// === Full-range CLMM bounds (platform fee tier) ===
+
+// Q64.64 sqrt prices bounding a full-range position at the platform's ONLY
+// fee tier: Cetus tick spacing 200, i.e. ticks +/-443600.
+//
+// Literals rather than calls to `tick_math::get_sqrt_price_at_tick`, which is
+// table-driven bit manipulation the prover cannot discharge. `config` pins
+// the tick spacing to 200 precisely so these are constants, which is what
+// lets the seeding proofs be stated at all. The migration test
+// `full_range_sqrt_prices_match_cetus` asserts they equal what Cetus really
+// computes, so a Cetus dependency bump that moved them would fail loudly
+// instead of silently invalidating the proofs.
+
+public fun full_range_lower_sqrt_price(): u128 { 4302785677 }
+
+public fun full_range_upper_sqrt_price(): u128 { 79084200890414257525634219231 }
+
 // === Linear release ===
 
 /// Amount released by a linear schedule after `served_ms` of its
