@@ -335,8 +335,8 @@ fun buy_and_sell_roundtrip_with_fees() {
         let fee = 1_000_000; // 1% of gross
         let (platform_fees, creator_fees) = pool.accrued_fees();
         assert!(platform_fees + creator_fees == fee);
-        // 70/30 split from config defaults.
-        assert!(platform_fees == fee * 7 / 10);
+        // 50/50 split from config defaults.
+        assert!(platform_fees == fee * 5 / 10);
         let (_, _, quote_reserve) = pool.real_reserves();
         assert!(quote_reserve == quote_in - fee);
         ts::return_shared(pool);

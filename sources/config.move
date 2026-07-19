@@ -168,9 +168,9 @@ fun init(ctx: &mut TxContext) {
         initial_virtual_base: 800_000_000_000_000_000, // 800M with 9 decimals
         remain_base: 200_000_000_000_000_000, // 200M with 9 decimals
         curve_fee_bps: 100, // 1%
-        curve_fee_platform_bps: 7_000, // 70% platform / 30% creator
+        curve_fee_platform_bps: 5_000, // 50% platform / 50% creator
         lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
-        migration_fee_bps: 500, // 5% of the raise, at graduation
+        migration_fee_bps: 200, // 2% of the raise, at graduation
         tick_spacing: 200, // Cetus 1% fee tier
         min_lock_duration_ms: 24 * 60 * 60 * 1000, // 24 hours
         tvl_target_multiplier: 3,
@@ -498,9 +498,9 @@ public fun init_for_testing(ctx: &mut TxContext) {
         initial_virtual_base: 800_000_000_000_000,
         remain_base: 200_000_000_000_000,
         curve_fee_bps: 100,
-        curve_fee_platform_bps: 7_000,
+        curve_fee_platform_bps: 5_000,
         lp_fee_platform_bps: 5_000,
-        migration_fee_bps: 500,
+        migration_fee_bps: 200,
         tick_spacing: 200,
         min_lock_duration_ms: 24 * 60 * 60 * 1000,
         tvl_target_multiplier: 3,
