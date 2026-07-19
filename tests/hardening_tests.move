@@ -253,21 +253,23 @@ fun oversized_first_buy_clamps_to_cap() {
     // A time tranche funded far beyond the 3% cap is CLAMPED to exactly 3% of
     // total supply (I+R = 1e15 → 3e13), and the excess quote is refunded rather
     // than aborting the launch.
-    try_create(
+    let change = create_returning_change(
         &mut scenario,
         &clock,
-        option::none(),
         vector[2_000_000_000],
         vector[pool::lock_kind_time()],
         vector[1_000 + MIN_LOCK_MS],
         2_000_100_000,
-        0,
     );
+    // The refund half of the claim above, which previously went unasserted:
+    // change exceeds the 100_000 of slack in the payment, so quote from the
+    // tranche's own gross came back rather than being kept by the pool.
+    assert!(change > 100_000);
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         let (_, _, _, locked, _) = pool.tranche_info(0);
-        assert!(locked == 30_000_000_000_000); // exactly 3% of supply
+        assert!(locked == MAX_TIME_BASE); // exactly 3% of supply
         ts::return_shared(pool);
     };
     clock.destroy_for_testing();
@@ -663,6 +665,142 @@ fun add_quote_rejects_min_threshold_below_floor() {
         config::add_quote<ZZZ_BASE>(&admin_cap, &mut cfg, 6, 1_000_000, 999, 0, 1, 1);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+// === First-buy caps ===
+
+// `init_for_testing` sets both caps to 10_000 bps so the existing tranche
+// tests can use large first-buys, which means the clamp, refund and
+// skip-exhausted branches of `execute_tranche_buys` are never reached by the
+// rest of the suite. These tests install production-like caps and drive all
+// three, so the logic is protected against regression rather than merely
+// correct today.
+
+const TIME_CAP_BPS: u64 = 300; // 3% of supply, the production default
+const TVL_CAP_BPS: u64 = 500; // 5% of supply, the production default
+// init_for_testing mints 8e14 + 2e14 = 1e15 total supply.
+const MAX_TIME_BASE: u64 = 30_000_000_000_000; // 3% of 1e15
+const MAX_TVL_BASE: u64 = 50_000_000_000_000; // 5% of 1e15
+/// Far more quote than the caps can absorb, so every first-buy below is
+/// oversized and must be clamped.
+const OVERSIZED_BUY: u64 = 1_000_000_000;
+
+fun setup_with_caps(): (Scenario, Clock) {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 3, TIME_CAP_BPS, TVL_CAP_BPS,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    (scenario, clock)
+}
+
+/// Like `try_create`, but returns the creator's change so the refund of
+/// cap-clamped quote can be asserted.
+fun create_returning_change(
+    scenario: &mut Scenario,
+    clock: &Clock,
+    tranche_quote_in: vector<u64>,
+    tranche_lock_kind: vector<u8>,
+    tranche_lock_param: vector<u64>,
+    payment: u64,
+): u64 {
+    scenario.next_tx(CREATOR);
+    let (receipt, mut currency) = pool::new_sealed_base_for_testing<ZZZ_BASE>(scenario.ctx());
+    let mut cetus_env = mocks::new_cetus_env(scenario.ctx());
+    let mut cfg = scenario.take_shared<LaunchpadConfig>();
+    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+    let change = pool::create_token<ZZZ_BASE, MOCK_QUOTE>(
+        &mut cfg,
+        &mut currency,
+        receipt,
+        mocks::mint_quote<MOCK_QUOTE>(CREATION_FEE, scenario.ctx()),
+        option::none(),
+        b"".to_string(),
+        b"".to_string(),
+        b"".to_string(),
+        b"".to_string(),
+        tranche_quote_in,
+        tranche_lock_kind,
+        tranche_lock_param,
+        mocks::mint_quote<MOCK_QUOTE>(payment, scenario.ctx()),
+        cetus_config,
+        cetus_pools,
+        clock,
+        scenario.ctx(),
+    );
+    let change_value = change.value();
+    transfer::public_transfer(change, CREATOR);
+    ts::return_shared(cfg);
+    mocks::destroy_cetus_env(cetus_env);
+    unit_test::destroy(currency);
+    change_value
+}
+
+#[test]
+/// The TIME and TVL caps are tracked independently and stack: a launch can
+/// take both in full, and neither eats into the other's budget.
+fun first_buy_caps_are_independent_and_stack() {
+    let (mut scenario, clock) = setup_with_caps();
+    create_returning_change(
+        &mut scenario,
+        &clock,
+        vector[OVERSIZED_BUY, OVERSIZED_BUY],
+        vector[pool::lock_kind_time(), pool::lock_kind_tvl()],
+        vector[1_000_000 + MIN_LOCK_MS, 50_000_000_000],
+        2 * OVERSIZED_BUY,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        assert!(pool.tranche_count() == 2);
+        let (kind0, _, _, locked0, _) = pool.tranche_info(0);
+        let (kind1, _, _, locked1, _) = pool.tranche_info(1);
+        assert!(kind0 == pool::lock_kind_time() && locked0 == MAX_TIME_BASE);
+        assert!(kind1 == pool::lock_kind_tvl() && locked1 == MAX_TVL_BASE);
+        ts::return_shared(pool);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test]
+/// Once a lock kind's cap is exhausted, later tranches of that kind lock
+/// nothing. They must be SKIPPED rather than recorded as zero-value
+/// tranches, and their quote fully refunded — otherwise the on-chain tranche
+/// indices would not match the ones unlock calls use.
+fun exhausted_cap_skips_later_tranches() {
+    let (mut scenario, clock) = setup_with_caps();
+    let unlock_at = 1_000_000 + MIN_LOCK_MS;
+    let change = create_returning_change(
+        &mut scenario,
+        &clock,
+        vector[OVERSIZED_BUY, OVERSIZED_BUY, OVERSIZED_BUY],
+        vector[pool::lock_kind_time(), pool::lock_kind_time(), pool::lock_kind_time()],
+        vector[unlock_at, unlock_at, unlock_at],
+        3 * OVERSIZED_BUY,
+    );
+    // Tranches 2 and 3 bought nothing, so their quote is returned untouched.
+    assert!(change >= 2 * OVERSIZED_BUY);
+
+    scenario.next_tx(CREATOR);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        // One recorded tranche, not three.
+        assert!(pool.tranche_count() == 1);
+        let (_, _, _, locked, _) = pool.tranche_info(0);
+        assert!(locked == MAX_TIME_BASE);
+        ts::return_shared(pool);
     };
     clock.destroy_for_testing();
     scenario.end();
