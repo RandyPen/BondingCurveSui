@@ -72,6 +72,20 @@ the Sui Prover — constant-product invariant preservation, reserve
 conservation/solvency, exact fee/`isqrt` semantics, and a no-profit
 round-trip theorem. See `specs/README.md`; run with `specs/prove.sh`.
 
+The **migration seeding branch selection** is proved too, which matters
+because a wrong branch there strands the whole raise permanently (`migrate` is
+permissionless and cannot be paused, and a COMPLETED pool cannot sell). The
+lemma — *if fixing the base leg would demand more quote than the pool holds,
+then fixing the quote leg demands no more base than it holds* — is proved over
+`specs/sources/cetus_model.move`, a faithful port of the Cetus liquidity math,
+since the prover's pipeline cannot load the CetusClmm dependency tree. Two
+bridges carry it to production: the port's formulas are annotated against the
+pinned Cetus rev, and `full_range_sqrt_prices_match_cetus` asserts the
+full-range constants against the real dependency, so a dependency bump fails
+loudly. The proof assumes the seed price stays 2^32 away from either
+full-range endpoint — the same condition under which Cetus's own `u128`
+liquidity and `checked_shlw` do not abort.
+
 Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR resolves on mainnet (cetus-contracts @ clmm-v14 — real sources, so unit tests create real CLMM pools); the lp_burn interface is vendored locally (`vendor/lp_burn`) to drop its clmm_vester transitive dependency, whose MVR resolution fails outside mainnet.
 
 ## Deployment checklist (read before testnet/mainnet)
