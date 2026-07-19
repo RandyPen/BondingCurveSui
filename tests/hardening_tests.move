@@ -805,3 +805,40 @@ fun exhausted_cap_skips_later_tranches() {
     clock.destroy_for_testing();
     scenario.end();
 }
+
+#[test]
+/// The case that MOTIVATES skipping rather than recording a zero-value
+/// tranche. When the dropped tranche sits in the middle, every later tranche
+/// lands at an on-chain index below its input-vector position. Unlock calls
+/// address the on-chain index, so a client that assumed "my third input is
+/// index 2" would address the wrong tranche — which is why
+/// `execute_tranche_buys` emits `pool.tranches.length()` in
+/// `TrancheLockedEvent` rather than the loop counter.
+fun skipped_tranche_shifts_later_on_chain_indices() {
+    let (mut scenario, clock) = setup_with_caps();
+    let unlock_at = 1_000_000 + MIN_LOCK_MS;
+    create_returning_change(
+        &mut scenario,
+        &clock,
+        vector[OVERSIZED_BUY, OVERSIZED_BUY, OVERSIZED_BUY],
+        // Input 1 exhausts the TIME cap and is dropped; input 2 is a TVL
+        // tranche with its own untouched budget.
+        vector[pool::lock_kind_time(), pool::lock_kind_time(), pool::lock_kind_tvl()],
+        vector[unlock_at, unlock_at, 50_000_000_000],
+        3 * OVERSIZED_BUY,
+    );
+    scenario.next_tx(CREATOR);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        assert!(pool.tranche_count() == 2);
+        let (kind0, _, _, locked0, _) = pool.tranche_info(0);
+        // Input index 2 lives at ON-CHAIN index 1: the shift is real, and
+        // this is the index the creator must pass to claim it.
+        let (kind1, _, _, locked1, _) = pool.tranche_info(1);
+        assert!(kind0 == pool::lock_kind_time() && locked0 == MAX_TIME_BASE);
+        assert!(kind1 == pool::lock_kind_tvl() && locked1 == MAX_TVL_BASE);
+        ts::return_shared(pool);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
