@@ -707,12 +707,20 @@ fun execute_tranche_buys<Base, Quote>(
         payment.balance_mut().join(change);
 
         let base_locked = base_out.value();
-        if (base_locked == 0) {
-            // The cap left no room, or the curve completed first; nothing to
-            // lock (the quote was fully refunded above). Skip it rather than
-            // record a no-op tranche — the kind then simply has no tranche.
-            base_out.destroy_zero();
-        } else {
+        // Unreachable, and asserted rather than skipped so it stays that way.
+        // `buy_internal` clamps to `min(sellable, budget)`: `sellable` is
+        // nonzero because reaching the floor flips the phase to COMPLETED and
+        // the next entry would abort `ENotTrading`, and `budget` is nonzero
+        // because `config` bounds `first_buy_*_cap_bps > 0` and `remain_base
+        // >= MIN_REMAIN_BASE`. That makes the per-kind cap safe WITHOUT the
+        // cumulative accumulators this function used to carry — but only
+        // while `budget > 0` holds, and that is proven a file away. Silently
+        // skipping here would turn a relaxed config bound into a cap BYPASS:
+        // a zero-value first entry adds no dynamic field, so the uniqueness
+        // assert above would let a second entry of the same kind through with
+        // a fresh full budget. Aborting keeps the invariant local.
+        assert!(base_locked > 0, EZeroOutput);
+        {
             let pool_id = pool.id.to_inner();
             if (kind == LOCK_KIND_TIME) {
                 df::add(
