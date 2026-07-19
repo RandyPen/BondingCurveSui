@@ -73,6 +73,40 @@ const MIN_QUOTE_THRESHOLD: u64 = 1_000;
 /// `total_locked * vested_ms` (both u64) far inside u128 in the release
 /// ratio, and stops an admin from setting a schedule that never completes.
 const MAX_TVL_VESTING_DURATION_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
+/// Floor on a TIME tranche's lock duration: 1 hour.
+///
+/// Unlike the TVL path there is NO second line of defence here. A TVL gate is
+/// cheap to force, but the linear window behind it still rate-limits the exit;
+/// a TIME tranche is a bare cliff, so its timestamp is the entire protection.
+/// With no floor, `min_lock_duration_ms = 0` makes `unlock_ts_ms = now` legal
+/// at `pool.move`'s launch check, and `unlock_tranche_time` asserts
+/// `now >= unlock_ts_ms` -- NON-strict. A single PTB could then create the
+/// token and unlock the creator's first buy in the next command, both
+/// commands reading the same Clock: a cap-sized buy at the opening price with
+/// no lock at all.
+const MIN_LOCK_DURATION_MS: u64 = 60 * 60 * 1000;
+/// Floor on the TVL market-cap multiplier.
+///
+/// The target is `multiplier` times the launch's graduation market cap, and
+/// the migration seeds gap-free, so the post-migration spot price IS the
+/// graduation price. At a multiplier of 1 the target is therefore met the
+/// instant migration lands -- the gate opens with zero price movement and the
+/// condition the launch advertised carries no weight. (The default migration
+/// fee burn leaves it a hair short, but `set_fee_params` permits a zero
+/// migration fee, and then it is met exactly.) 2 is the smallest multiplier
+/// that requires the price to actually go up.
+const MIN_TVL_TARGET_MULTIPLIER: u64 = 2;
+/// Ceiling on the same multiplier. `pool` computes the market-cap target as
+/// `multiplier * (I+R) * T / R` in u128; past roughly 3.4e8 with default
+/// launch params that overflows and aborts every `create_token`. Same class
+/// of footgun MAX_TVL_VESTING_DURATION_MS exists to prevent.
+const MAX_TVL_TARGET_MULTIPLIER: u64 = 1_000;
+/// Ceiling on the TIME lock, 10 years, matching the vesting cap. `pool` adds
+/// this to `clock.timestamp_ms()` in u64, so an unbounded value overflows and
+/// aborts every TIME-tranche launch.
+const MAX_LOCK_DURATION_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
+/// Largest u64, for the virtual-reserve headroom check below.
+const U64_MAX_U128: u128 = 0xffff_ffff_ffff_ffff;
 
 // === Structs ===
 
@@ -343,7 +377,19 @@ public fun set_launch_params(
     cfg.assert_version();
     assert!(remain_base >= MIN_REMAIN_BASE, EInvalidLaunchParams);
     assert!(initial_virtual_base > remain_base, EInvalidLaunchParams);
-    assert!(tvl_target_multiplier > 0, EInvalidLaunchParams);
+    assert!(tvl_target_multiplier >= MIN_TVL_TARGET_MULTIPLIER, EInvalidLaunchParams);
+    assert!(tvl_target_multiplier <= MAX_TVL_TARGET_MULTIPLIER, EInvalidLaunchParams);
+    assert!(min_lock_duration_ms >= MIN_LOCK_DURATION_MS, EInvalidLaunchParams);
+    assert!(min_lock_duration_ms <= MAX_LOCK_DURATION_MS, EInvalidLaunchParams);
+    // The virtual base reserve `I^2/(I-R)` must fit u64, or `curve::
+    // derive_virtual_reserves` aborts EReserveOverflow on EVERY launch. The
+    // ratio and floor asserts above do not imply it: I = 1e10+1, R = 1e10
+    // satisfies both and still overflows by 5x. Checked here for the reason
+    // MIN_REMAIN_BASE is -- a rejected config is a recoverable mistake, a
+    // config that bricks every launch until someone notices is not.
+    let denom = (initial_virtual_base - remain_base) as u128;
+    let vb0 = (initial_virtual_base as u128) * (initial_virtual_base as u128) / denom;
+    assert!(vb0 <= U64_MAX_U128, EInvalidLaunchParams);
     assert!(first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= 10_000, EInvalidLaunchParams);
     assert!(first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= 10_000, EInvalidLaunchParams);
     // Base decimals are locked at the platform standard: `pool::seal` hard-codes

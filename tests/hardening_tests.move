@@ -141,6 +141,80 @@ fun create_rejects_threshold_below_minimum() {
     scenario.end();
 }
 
+// === Admin launch-param floors ===
+
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// A TIME tranche is a bare cliff -- no vesting window stands behind it, so
+/// its timestamp is the whole protection. `min_lock_duration_ms = 0` would
+/// make `unlock_ts_ms = now` a legal lock, and `unlock_tranche_time` asserts
+/// `now >= unlock_ts_ms` NON-strictly, so one PTB could create the token and
+/// unlock the creator's capped first buy in the very next command (both
+/// commands read the same Clock). The floor makes that config unreachable.
+fun set_launch_params_rejects_zero_lock_duration() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, 0, 3, 300, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// Migration seeds gap-free, so the post-migration spot price IS the
+/// graduation price: a multiplier of 1 sets a market-cap target that is
+/// already met the instant migration lands, and the gate opens with no price
+/// movement at all. 2 is the smallest multiplier that demands an actual rise.
+fun set_launch_params_rejects_unit_tvl_multiplier() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 1, 300, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// `vb0 = I^2/(I-R)` must fit u64. I = 1e10+1, R = 1e10 clears every other
+/// assert -- R is above MIN_REMAIN_BASE, I > R, and the I/R ratio is 1 --
+/// yet vb0 is 1e20, five times u64::MAX, so `derive_virtual_reserves` would
+/// abort EReserveOverflow on every single launch. Caught at config time,
+/// where it is recoverable, instead of at launch time where it is silent.
+fun set_launch_params_rejects_overflowing_virtual_reserve() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            10_000_000_001, 10_000_000_000,
+            200, MIN_LOCK_MS, 3, 300, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
 // === Tranche validation ===
 
 #[test, expected_failure(abort_code = pool::ETooManyTranches)]
