@@ -79,6 +79,8 @@ const EProjectInfoTooLong: u64 = 25;
 const ENotPendingCreator: u64 = 26;
 /// No creator nomination is pending.
 const ENoPendingCreator: u64 = 27;
+/// A trade named its own sender as the referrer.
+const ESelfReferral: u64 = 28;
 // Code 28 (ETrancheExceedsCap) retired: an over-cap first-buy is now clamped to
 // the cap with the excess quote refunded, rather than aborting.
 
@@ -179,6 +181,7 @@ public struct Pool<phantom Base, phantom Quote> has key {
     // not affect live pools.
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
+    referral_bps: u64,
     lp_fee_platform_bps: u64,
     migration_fee_bps: u64,
     tick_spacing: u32,
@@ -243,6 +246,15 @@ public struct TradedEvent<phantom Base, phantom Quote> has copy, drop {
     fee: u64,
     virtual_base: u64,
     virtual_quote: u64,
+}
+
+/// Emitted when a referred trade pays out. The payment is immediate — there
+/// is no on-chain referral ledger, so this event is the record of record.
+public struct ReferralPaidEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    trader: address,
+    referrer: address,
+    amount: u64,
 }
 
 public struct CurveCompletedEvent<phantom Base, phantom Quote> has copy, drop {
@@ -456,6 +468,7 @@ public fun create_token<Base, Quote>(
         creator_fees: balance::zero(),
         curve_fee_bps: cfg.curve_fee_bps(),
         curve_fee_platform_bps: cfg.curve_fee_platform_bps(),
+        referral_bps: cfg.referral_bps(),
         lp_fee_platform_bps: cfg.lp_fee_platform_bps(),
         migration_fee_bps: cfg.migration_fee_bps(),
         tick_spacing: cfg.tick_spacing(),
@@ -606,7 +619,15 @@ fun execute_tranche_buys<Base, Quote>(
         let budget = if (kind == LOCK_KIND_TIME) max_time_base - time_base
             else max_tvl_base - tvl_base;
         let (base_out, change) =
-            buy_internal(pool, payment.balance_mut().split(gross), creator, budget, clock);
+            // Creator first-buys are never referred.
+            buy_internal(
+                pool,
+                payment.balance_mut().split(gross),
+                creator,
+                budget,
+                option::none(),
+                clock,
+            );
         // Cap-clamped (and/or completion-clamped) excess quote returns to payment.
         let quote_spent = gross - change.value();
         payment.balance_mut().join(change);
@@ -653,15 +674,23 @@ public fun buy<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     quote_in: Coin<Quote>,
     min_base_out: u64,
+    referrer: Option<address>,
     clock: &Clock,
     ctx: &mut TxContext,
 ): (Coin<Base>, Coin<Quote>) {
     cfg.assert_version();
     cfg.assert_not_paused();
     assert!(quote_in.value() >= pool.min_buy_amount, EBelowMinBuy);
+    assert_not_self_referral(&referrer, ctx.sender());
 
-    let (base_out, change) =
-        buy_internal(pool, quote_in.into_balance(), ctx.sender(), NO_FIRST_BUY_CAP, clock);
+    let (base_out, change) = buy_internal(
+        pool,
+        quote_in.into_balance(),
+        ctx.sender(),
+        NO_FIRST_BUY_CAP,
+        referrer,
+        clock,
+    );
     assert!(base_out.value() >= min_base_out, ESlippage);
     (base_out.into_coin(ctx), change.into_coin(ctx))
 }
@@ -672,10 +701,12 @@ public fun sell<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     base_in: Coin<Base>,
     min_quote_out: u64,
+    referrer: Option<address>,
     ctx: &mut TxContext,
 ): Coin<Quote> {
     cfg.assert_version();
     assert!(pool.phase == PHASE_TRADING, ENotTrading);
+    assert_not_self_referral(&referrer, ctx.sender());
 
     let amount_in = base_in.value();
     let (quote_out, new_vb, new_vq) =
@@ -689,7 +720,7 @@ public fun sell<Base, Quote>(
     pool.virtual_quote = new_vq;
     pool.base_reserve.join(base_in.into_balance());
     let mut out = pool.quote_reserve.split(quote_out);
-    pool.accrue_fee(out.split(fee));
+    pool.accrue_fee(out.split(fee), ctx.sender(), referrer);
 
     event::emit(TradedEvent<Base, Quote> {
         pool_id: pool.id.to_inner(),
@@ -709,10 +740,11 @@ entry fun buy_entry<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     quote_in: Coin<Quote>,
     min_base_out: u64,
+    referrer: Option<address>,
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
-    let (base_out, change) = buy(cfg, pool, quote_in, min_base_out, clock, ctx);
+    let (base_out, change) = buy(cfg, pool, quote_in, min_base_out, referrer, clock, ctx);
     send_funds(base_out, ctx.sender());
     send_funds(change, ctx.sender());
 }
@@ -722,9 +754,10 @@ entry fun sell_entry<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
     base_in: Coin<Base>,
     min_quote_out: u64,
+    referrer: Option<address>,
     ctx: &mut TxContext,
 ) {
-    let quote_out = sell(cfg, pool, base_in, min_quote_out, ctx);
+    let quote_out = sell(cfg, pool, base_in, min_quote_out, referrer, ctx);
     send_funds(quote_out, ctx.sender());
 }
 
@@ -735,6 +768,7 @@ fun buy_internal<Base, Quote>(
     mut quote_in: Balance<Quote>,
     trader: address,
     max_base_out: u64,
+    referrer: Option<address>,
     clock: &Clock,
 ): (Balance<Base>, Balance<Quote>) {
     assert!(pool.phase == PHASE_TRADING, ENotTrading);
@@ -766,7 +800,7 @@ fun buy_internal<Base, Quote>(
     pool.virtual_base = new_vb;
     pool.virtual_quote = new_vq;
     pool.quote_reserve.join(quote_in.split(net_used));
-    pool.accrue_fee(quote_in.split(fee_used));
+    pool.accrue_fee(quote_in.split(fee_used), trader, referrer);
     // Whatever remains in quote_in is the caller's change.
 
     let base_out = pool.base_reserve.split(base_out_amount);
@@ -793,12 +827,47 @@ fun buy_internal<Base, Quote>(
     (base_out, quote_in)
 }
 
-fun accrue_fee<Base, Quote>(pool: &mut Pool<Base, Quote>, mut fee: Balance<Quote>) {
-    let platform_cut =
-        ((fee.value() as u128) * (pool.curve_fee_platform_bps as u128)
-            / (config::bps_denominator() as u128)) as u64;
-    pool.platform_fees.join(fee.split(platform_cut));
+/// Splits a trade's fee three ways: the referrer is paid immediately, the
+/// platform keeps its cut less that payout, and the creator takes the
+/// remainder. Because the referral share is carved out of the platform's cut
+/// (`referral_bps <= curve_fee_platform_bps`, enforced by `set_fee_params`),
+/// the creator's amount is bit-for-bit what it would be with no referrer.
+fun accrue_fee<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    mut fee: Balance<Quote>,
+    trader: address,
+    referrer: Option<address>,
+) {
+    let total = fee.value();
+    let platform_cut = mul_div_bps(total, pool.curve_fee_platform_bps);
+    let referral_cut = if (referrer.is_some()) {
+        mul_div_bps(total, pool.referral_bps)
+    } else {
+        0
+    };
+    pool.platform_fees.join(fee.split(platform_cut - referral_cut));
+    if (referral_cut > 0) {
+        let referrer = *referrer.borrow();
+        balance::send_funds(fee.split(referral_cut), referrer);
+        event::emit(ReferralPaidEvent<Base, Quote> {
+            pool_id: pool.id.to_inner(),
+            trader,
+            referrer,
+            amount: referral_cut,
+        });
+    };
     pool.creator_fees.join(fee);
+}
+
+/// Self-referral would just be a fee rebate on your own trade. Rejecting it
+/// only stops the laziest case — a second wallet defeats it — so this is a
+/// guard rail, not a sybil defence.
+fun assert_not_self_referral(referrer: &Option<address>, sender: address) {
+    assert!(referrer.is_none() || *referrer.borrow() != sender, ESelfReferral);
+}
+
+fun mul_div_bps(amount: u64, bps: u64): u64 {
+    ((amount as u128) * (bps as u128) / (config::bps_denominator() as u128)) as u64
 }
 
 // === Fee distribution ===
@@ -1080,6 +1149,10 @@ public fun migration_fee_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
 
 public fun lp_fee_platform_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
     pool.lp_fee_platform_bps
+}
+
+public fun referral_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
+    pool.referral_bps
 }
 
 public fun tick_spacing<Base, Quote>(pool: &Pool<Base, Quote>): u32 { pool.tick_spacing }

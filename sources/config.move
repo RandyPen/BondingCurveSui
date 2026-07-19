@@ -36,6 +36,10 @@ const BPS_DENOMINATOR: u64 = 10_000;
 const MAX_CURVE_FEE_BPS: u64 = 1_000;
 /// Hard cap on the migration (graduation) fee: 10%.
 const MAX_MIGRATION_FEE_BPS: u64 = 1_000;
+/// Hard cap on the taker referral share: 10% of the curve fee. The default
+/// sits at this cap, so the rate can only ever be lowered without a package
+/// upgrade.
+const MAX_REFERRAL_BPS: u64 = 1_000;
 /// Upper bound on initial_virtual_base / remain_base (see
 /// set_launch_params).
 const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
@@ -85,6 +89,10 @@ public struct LaunchpadConfig has key {
     curve_fee_bps: u64,
     /// Platform share of the curve fee; remainder accrues to the creator.
     curve_fee_platform_bps: u64,
+    /// Taker referral share of the curve fee, paid straight to the referrer
+    /// on every referred trade. Carved out of the platform's share (never
+    /// the creator's), so `referral_bps <= curve_fee_platform_bps` holds.
+    referral_bps: u64,
     /// Platform share of post-migration quote-side LP fees; remainder to
     /// the creator. Base-side LP fees are always burned.
     lp_fee_platform_bps: u64,
@@ -127,6 +135,7 @@ public struct QuoteUpdatedEvent has copy, drop {
 public struct FeeParamsUpdatedEvent has copy, drop {
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
+    referral_bps: u64,
     lp_fee_platform_bps: u64,
     migration_fee_bps: u64,
 }
@@ -168,7 +177,8 @@ fun init(ctx: &mut TxContext) {
         initial_virtual_base: 800_000_000_000_000_000, // 800M with 9 decimals
         remain_base: 200_000_000_000_000_000, // 200M with 9 decimals
         curve_fee_bps: 100, // 1%
-        curve_fee_platform_bps: 5_000, // 50% platform / 50% creator
+        curve_fee_platform_bps: 6_000, // 60% platform / 40% creator
+        referral_bps: 1_000, // 10% to the referrer, out of the platform's 60%
         lp_fee_platform_bps: 5_000, // 50% platform / 50% creator
         migration_fee_bps: 200, // 2% of the raise, at graduation
         tick_spacing: 200, // Cetus 1% fee tier
@@ -250,6 +260,7 @@ public fun set_fee_params(
     cfg: &mut LaunchpadConfig,
     curve_fee_bps: u64,
     curve_fee_platform_bps: u64,
+    referral_bps: u64,
     lp_fee_platform_bps: u64,
     migration_fee_bps: u64,
 ) {
@@ -258,13 +269,19 @@ public fun set_fee_params(
     assert!(curve_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
     assert!(lp_fee_platform_bps <= BPS_DENOMINATOR, EFeeTooHigh);
     assert!(migration_fee_bps <= MAX_MIGRATION_FEE_BPS, EFeeTooHigh);
+    assert!(referral_bps <= MAX_REFERRAL_BPS, EFeeTooHigh);
+    // The referral share is carved out of the platform's cut, so it can never
+    // reach into the creator's remainder.
+    assert!(referral_bps <= curve_fee_platform_bps, EFeeTooHigh);
     cfg.curve_fee_bps = curve_fee_bps;
     cfg.curve_fee_platform_bps = curve_fee_platform_bps;
+    cfg.referral_bps = referral_bps;
     cfg.lp_fee_platform_bps = lp_fee_platform_bps;
     cfg.migration_fee_bps = migration_fee_bps;
     event::emit(FeeParamsUpdatedEvent {
         curve_fee_bps,
         curve_fee_platform_bps,
+        referral_bps,
         lp_fee_platform_bps,
         migration_fee_bps,
     });
@@ -398,6 +415,8 @@ public fun curve_fee_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_bps }
 
 public fun curve_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.curve_fee_platform_bps }
 
+public fun referral_bps(cfg: &LaunchpadConfig): u64 { cfg.referral_bps }
+
 public fun lp_fee_platform_bps(cfg: &LaunchpadConfig): u64 { cfg.lp_fee_platform_bps }
 
 public fun migration_fee_bps(cfg: &LaunchpadConfig): u64 { cfg.migration_fee_bps }
@@ -498,7 +517,8 @@ public fun init_for_testing(ctx: &mut TxContext) {
         initial_virtual_base: 800_000_000_000_000,
         remain_base: 200_000_000_000_000,
         curve_fee_bps: 100,
-        curve_fee_platform_bps: 5_000,
+        curve_fee_platform_bps: 6_000,
+        referral_bps: 1_000,
         lp_fee_platform_bps: 5_000,
         migration_fee_bps: 200,
         tick_spacing: 200,

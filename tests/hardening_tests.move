@@ -366,6 +366,7 @@ fun disabling_quote_does_not_affect_live_pools() {
             &mut pool,
             mocks::mint_quote<MOCK_QUOTE>(1_000_000, scenario.ctx()),
             0,
+            option::none(),
             &clock,
             scenario.ctx(),
         );
@@ -403,7 +404,7 @@ fun fee_params_capped_at_ten_percent() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 1_001, 5_000, 5_000, 500);
+        config::set_fee_params(&admin_cap, &mut cfg, 1_001, 5_000, 1_000, 5_000, 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -418,7 +419,41 @@ fun migration_fee_capped_at_max() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 100, 5_000, 5_000, 1_001);
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 5_000, 1_000, 5_000, 1_001);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+/// The referral share sits at its hard cap by default, so it can only ever
+/// be lowered without a package upgrade.
+#[test, expected_failure(abort_code = config::EFeeTooHigh)]
+fun referral_bps_capped_at_max() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 5_000, 1_001, 5_000, 500);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+/// Referral must be carved out of the platform's cut, never the creator's:
+/// a platform share below the referral share is rejected.
+#[test, expected_failure(abort_code = config::EFeeTooHigh)]
+fun referral_bps_cannot_exceed_platform_share() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 500, 1_000, 5_000, 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -433,7 +468,7 @@ fun fee_split_capped_at_bps_denominator() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 100, 10_001, 5_000, 500);
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 10_001, 1_000, 5_000, 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -480,6 +515,7 @@ fun complete_with_tvl_tranche(scenario: &mut Scenario, clock: &Clock) {
             &mut pool,
             mocks::mint_quote<MOCK_QUOTE>(10_000_000_000, scenario.ctx()),
             0,
+            option::none(),
             clock,
             scenario.ctx(),
         );

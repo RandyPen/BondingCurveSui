@@ -17,6 +17,7 @@ const ADMIN: address = @0xAD;
 const CREATOR: address = @0xC0FFEE;
 const TRADER: address = @0x7EADE7;
 const NEW_CREATOR: address = @0xBEEF;
+const REFERRER: address = @0x4EF;
 
 const I: u64 = 800_000_000_000_000; // matches config defaults (800M @ 6 dec)
 const R: u64 = 200_000_000_000_000; // 200M @ 6 dec
@@ -100,6 +101,17 @@ fun buy_as(
     quote_in: u64,
     min_out: u64,
 ): (u64, u64) {
+    buy_as_referred(scenario, clock, trader, quote_in, min_out, option::none())
+}
+
+fun buy_as_referred(
+    scenario: &mut Scenario,
+    clock: &Clock,
+    trader: address,
+    quote_in: u64,
+    min_out: u64,
+    referrer: Option<address>,
+): (u64, u64) {
     scenario.next_tx(trader);
     let cfg = scenario.take_shared<LaunchpadConfig>();
     let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
@@ -108,6 +120,7 @@ fun buy_as(
         &mut pool,
         mocks::mint_quote<MOCK_QUOTE>(quote_in, scenario.ctx()),
         min_out,
+        referrer,
         clock,
         scenario.ctx(),
     );
@@ -125,7 +138,7 @@ fun sell_as(scenario: &mut Scenario, trader: address, min_out: u64): u64 {
     let cfg = scenario.take_shared<LaunchpadConfig>();
     let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
     let base = scenario.take_from_sender<Coin<ZZZ_BASE>>();
-    let quote = pool::sell(&cfg, &mut pool, base, min_out, scenario.ctx());
+    let quote = pool::sell(&cfg, &mut pool, base, min_out, option::none(), scenario.ctx());
     let out = quote.value();
     transfer::public_transfer(quote, trader);
     ts::return_shared(cfg);
@@ -316,6 +329,51 @@ fun create_token_rejects_past_time_lock() {
     end(scenario, clock, currency);
 }
 
+// === Taker referral ===
+
+/// A referred buy pays the referrer out of the platform's cut: with the
+/// config defaults (platform 60%, referral 10%) the pool keeps 50% for the
+/// platform, and the 10% has already left the pool.
+#[test]
+fun referred_buy_pays_out_of_platform_cut() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+
+    let quote_in = 100_000_000;
+    let (base_out, _) = buy_as_referred(
+        &mut scenario, &clock, TRADER, quote_in, 0, option::some(REFERRER),
+    );
+    assert!(base_out > 0);
+
+    scenario.next_tx(TRADER);
+    {
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let fee = 1_000_000; // 1% of gross
+        let (platform_fees, creator_fees) = pool.accrued_fees();
+        // Platform keeps 60% - 10% = 50%; the referrer's 10% is already paid.
+        assert!(platform_fees == fee * 5 / 10);
+        // The creator is untouched by referral: still the full 40%.
+        assert!(creator_fees == fee * 4 / 10);
+        assert!(platform_fees + creator_fees == fee - fee / 10);
+        ts::return_shared(pool);
+    };
+    end(scenario, clock, currency);
+}
+
+#[test, expected_failure(abort_code = pool::ESelfReferral)]
+fun self_referral_rejected() {
+    let (mut scenario, clock) = setup();
+    let currency = create_test_token(
+        &mut scenario, &clock, vector[], vector[], vector[], 0,
+    );
+    buy_as_referred(
+        &mut scenario, &clock, TRADER, 100_000_000, 0, option::some(TRADER),
+    );
+    end(scenario, clock, currency);
+}
+
 // === Trading ===
 
 #[test]
@@ -335,8 +393,8 @@ fun buy_and_sell_roundtrip_with_fees() {
         let fee = 1_000_000; // 1% of gross
         let (platform_fees, creator_fees) = pool.accrued_fees();
         assert!(platform_fees + creator_fees == fee);
-        // 50/50 split from config defaults.
-        assert!(platform_fees == fee * 5 / 10);
+        // 60/40 split from config defaults; unreferred, so no referral cut.
+        assert!(platform_fees == fee * 6 / 10);
         let (_, _, quote_reserve) = pool.real_reserves();
         assert!(quote_reserve == quote_in - fee);
         ts::return_shared(pool);

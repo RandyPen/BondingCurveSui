@@ -116,6 +116,7 @@ fun launch_and_complete<B: drop>(
             &mut pool,
             mocks::mint_quote<MOCK_QUOTE>(10_000_000_000, scenario.ctx()),
             0,
+            option::none(),
             clock,
             scenario.ctx(),
         );
@@ -343,7 +344,7 @@ fun migrate_with_zero_fee_seeds_full_amounts() {
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        config::set_fee_params(&admin_cap, &mut cfg, 100, 7_000, 5_000, 0);
+        config::set_fee_params(&admin_cap, &mut cfg, 100, 6_000, 1_000, 5_000, 0);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };

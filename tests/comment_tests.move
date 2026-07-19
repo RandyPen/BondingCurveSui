@@ -372,6 +372,7 @@ fun comment_allowed_after_curve_completes() {
             &mut pool,
             mocks::mint_quote<MOCK_QUOTE>(THRESHOLD * 2, scenario.ctx()),
             0,
+            option::none(),
             &clock,
             scenario.ctx(),
         );
