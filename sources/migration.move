@@ -105,6 +105,23 @@ public struct LpRewardsClaimedEvent<phantom Base, phantom Quote> has copy, drop 
 /// the raised liquidity into a fresh full-range Cetus CLMM position,
 /// burn the position through lp_burn (the proof stays in the launchpad
 /// pool), and flush accrued curve fees.
+///
+/// Deliberately NOT pause-gated, unlike `create_token` and `buy`. Those two
+/// are discretionary new exposure, and pausing them still leaves `sell` open
+/// as an exit. A COMPLETED pool has no such exit: `sell` requires
+/// PHASE_TRADING, so it is already closed by the time this runs. Gating
+/// migration on the pause switch would therefore trap holders with no way out
+/// at all until an admin relents — strictly worse than any incident it could
+/// contain.
+///
+/// The flip side is the guarantee that makes it worth it: once the curve
+/// completes, graduation is unstoppable, by the admin included. The raise
+/// reaches a permissionless AMM regardless of who wants otherwise.
+///
+/// The cost of that guarantee is real and accepted: if a defect is ever found
+/// in the seeding math, completed pools keep migrating through it and there
+/// is no switch to stop them. That argues for verifying migration changes
+/// exhaustively before publishing, not for adding a freeze.
 public fun migrate<Base, Quote>(
     cfg: &LaunchpadConfig,
     pool: &mut Pool<Base, Quote>,
