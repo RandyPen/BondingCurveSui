@@ -51,8 +51,8 @@ fun claim_straight<B: drop>(
     let mut pool = scenario.take_shared<Pool<B, MOCK_QUOTE>>();
     let cetus_pool = scenario.take_shared<CetusPool<B, MOCK_QUOTE>>();
     migration::do_claim_tranche_tvl(&cfg, &mut pool, &cetus_pool, currency, 0, clock);
-    let (_, _, _, locked, _) = pool.tranche_info(0);
-    let (_, gate_open, _, _, _) = pool.tranche_vesting(0);
+    let (_, locked, _) = pool.tvl_tranche_info(0);
+    let (_, gate_open, _, _, _) = pool.tvl_tranche_vesting(0);
     ts::return_shared(cfg);
     ts::return_shared(pool);
     ts::return_shared(cetus_pool);
@@ -71,8 +71,8 @@ fun claim_inverted<B: drop>(
     migration::do_claim_tranche_tvl_inverted(
         &cfg, &mut pool, &cetus_pool, currency, 0, clock,
     );
-    let (_, _, _, locked, _) = pool.tranche_info(0);
-    let (_, gate_open, _, _, _) = pool.tranche_vesting(0);
+    let (_, locked, _) = pool.tvl_tranche_info(0);
+    let (_, gate_open, _, _, _) = pool.tvl_tranche_vesting(0);
     ts::return_shared(cfg);
     ts::return_shared(pool);
     ts::return_shared(cetus_pool);
@@ -488,7 +488,7 @@ fun tvl_tranche_releases_linearly_after_gate_opens() {
     scenario.next_tx(TRADER);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let (_, _, _, locked, claimed) = pool.tranche_info(0);
+        let (_, locked, claimed) = pool.tvl_tranche_info(0);
         assert!(locked == 0 && claimed);
         ts::return_shared(pool);
     };
@@ -518,7 +518,7 @@ fun tvl_tranche_releases_linearly_inverted_orientation() {
     scenario.next_tx(TRADER);
     {
         let pool = scenario.take_shared<Pool<AAA_BASE, MOCK_QUOTE>>();
-        let (_, _, _, locked, claimed) = pool.tranche_info(0);
+        let (_, locked, claimed) = pool.tvl_tranche_info(0);
         assert!(locked == 0 && claimed);
         ts::return_shared(pool);
     };
@@ -947,7 +947,7 @@ fun release_continues_after_price_falls_back() {
     scenario.next_tx(TRADER);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let (_, _, _, locked, claimed) = pool.tranche_info(0);
+        let (_, locked, claimed) = pool.tvl_tranche_info(0);
         assert!(locked == 0 && claimed);
         ts::return_shared(pool);
     };

@@ -154,25 +154,31 @@ public struct ProjectInfo has store, copy, drop {
 /// window behind it: the creator's exit is rate-limited, the gate opening is
 /// a public event, and nothing at all releases in the instant the gate opens.
 /// A flash pump therefore buys notice-then-a-slow-drip, never a dump.
-public struct CreatorTranche<phantom Base> has store {
+/// A time-locked creator first-buy: a cliff. Nothing to track but the
+/// balance and when it opens — "already claimed" is `locked.value() == 0`,
+/// which is unambiguous because `execute_tranche_buys` never records a
+/// zero-value tranche.
+public struct TimeTranche<phantom Base> has store {
     locked: Balance<Base>,
-    kind: u8,
-    /// Unlock timestamp (ms) when `kind == LOCK_KIND_TIME`.
+    /// Unlock timestamp (ms).
     unlock_ts_ms: u64,
-    /// Post-migration CLMM market-cap target in quote units when
-    /// `kind == LOCK_KIND_TVL`.
-    tvl_target: u64,
-    claimed: bool,
-    // === TVL gate + linear release state (unused by TIME tranches) ===
+}
+
+/// A market-cap-locked creator first-buy: a one-way gate, then a linear
+/// release. "Fully claimed" is `withdrawn == total_locked`.
+public struct TvlTranche<phantom Base> has store {
+    locked: Balance<Base>,
     /// Balance at lock time; the numerator of the release ratio.
     total_locked: u64,
-    /// True once the market-cap target has been observed. One-way: the gate
-    /// never closes and the price is never read again after it opens.
-    gate_open: bool,
+    /// Post-migration CLMM market-cap target, in quote units.
+    tvl_target: u64,
     /// Clock time the gate opened; the linear window runs from here. Paired
     /// with `gate_open` rather than using 0 as a sentinel, so a genuine
     /// timestamp of 0 cannot be mistaken for a closed gate.
     gate_opened_at_ms: u64,
+    /// True once the market-cap target has been observed. One-way: the gate
+    /// never closes and the price is never read again after it opens.
+    gate_open: bool,
     /// Cumulative amount already released, so each call pays only the delta.
     withdrawn: u64,
 }
@@ -213,8 +219,16 @@ public struct Pool<phantom Base, phantom Quote> has key {
     tvl_vesting_duration_ms: u64,
     /// Project description and social links; creator-updatable.
     project: ProjectInfo,
-    // Creator first-buy tranches.
-    tranches: vector<CreatorTranche<Base>>,
+    // Creator first-buy tranches, one vector per lock kind. Split so that
+    // passing a TVL tranche to the time path (or the reverse) is not
+    // expressible rather than merely asserted, and so neither kind carries
+    // the other's fields.
+    //
+    // Consequence for clients: tranche indices are PER KIND. The event TYPE
+    // says which vector an index addresses -- `TimeTranche*` events index
+    // `time_tranches`, `TvlTranche*` events index `tvl_tranches`.
+    time_tranches: vector<TimeTranche<Base>>,
+    tvl_tranches: vector<TvlTranche<Base>>,
     /// Reserves the (Base, Quote, tick_spacing) Cetus pool key at launch
     /// so nobody can front-run the migration's pool creation.
     pool_creation_cap: PoolCreationCap,
@@ -247,11 +261,28 @@ public struct ProjectInfoUpdatedEvent<phantom Base, phantom Quote> has copy, dro
     project: ProjectInfo,
 }
 
-public struct TrancheLockedEvent<phantom Base, phantom Quote> has copy, drop {
+// Tranche events are split per lock kind, like the tranches themselves.
+// A merged event would need a `kind` discriminator and would carry the other
+// kind's condition field as a permanent zero — the dead-field problem the
+// split structs exist to remove. It would also force every consumer to ingest
+// both kinds: `MoveEventType` subscribes to one fully-instantiated type, and
+// JSON-RPC cannot filter on field contents (see `comment.move`).
+//
+// `index` is the PER-KIND index into `time_tranches` / `tvl_tranches` — NOT
+// the position in the caller's input vectors, which diverges as soon as a
+// cap-exhausted tranche is skipped.
+
+public struct TimeTrancheLockedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     index: u64,
-    kind: u8,
     unlock_ts_ms: u64,
+    quote_in: u64,
+    base_locked: u64,
+}
+
+public struct TvlTrancheLockedEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    index: u64,
     tvl_target: u64,
     quote_in: u64,
     base_locked: u64,
@@ -296,7 +327,19 @@ public struct CurveFeesPaidEvent<phantom Base, phantom Quote> has copy, drop {
     referral_amount: u64,
 }
 
-public struct TrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
+/// A time tranche's cliff releasing in full.
+public struct TimeTrancheUnlockedEvent<phantom Base, phantom Quote> has copy, drop {
+    pool_id: ID,
+    index: u64,
+    amount: u64,
+    creator: address,
+}
+
+/// One slice of a TVL tranche's linear release. Emitted ONLY when something
+/// actually moves, so summing it gives creator payouts directly.
+/// `migration::TvlTrancheClaimedEvent` is the companion record of the
+/// market-cap OBSERVATION, emitted on every call including no-ops.
+public struct TvlTrancheReleasedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     index: u64,
     amount: u64,
@@ -501,7 +544,8 @@ public fun create_token<Base, Quote>(
         min_buy_amount: quote_params.quote_min_buy_amount(),
         tvl_vesting_duration_ms: cfg.tvl_vesting_duration_ms(),
         project: new_project_info(description, twitter, telegram, website),
-        tranches: vector[],
+        time_tranches: vector[],
+        tvl_tranches: vector[],
         pool_creation_cap,
         completed_at_ms: 0,
         cetus_pool_id: option::none(),
@@ -671,29 +715,40 @@ fun execute_tranche_buys<Base, Quote>(
             // rather than record a no-op tranche.
             base_out.destroy_zero();
         } else {
-            // Emit the on-chain tranche index (matches unlock calls), not the
-            // input-vector index, so skipped no-ops don't shift it.
-            let tranche_index = pool.tranches.length();
-            pool.tranches.push_back(CreatorTranche {
-                locked: base_out,
-                kind,
-                unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
-                tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
-                claimed: false,
-                total_locked: base_locked,
-                gate_open: false,
-                gate_opened_at_ms: 0,
-                withdrawn: 0,
-            });
-            event::emit(TrancheLockedEvent<Base, Quote> {
-                pool_id: pool.id.to_inner(),
-                index: tranche_index,
-                kind,
-                unlock_ts_ms: if (kind == LOCK_KIND_TIME) param else 0,
-                tvl_target: if (kind == LOCK_KIND_TVL) param else 0,
-                quote_in: quote_spent,
-                base_locked,
-            });
+            // Emit the on-chain, PER-KIND index (the one unlock calls take),
+            // not the input-vector index — skipped no-ops shift them apart.
+            let pool_id = pool.id.to_inner();
+            if (kind == LOCK_KIND_TIME) {
+                let index = pool.time_tranches.length();
+                pool.time_tranches.push_back(TimeTranche {
+                    locked: base_out,
+                    unlock_ts_ms: param,
+                });
+                event::emit(TimeTrancheLockedEvent<Base, Quote> {
+                    pool_id,
+                    index,
+                    unlock_ts_ms: param,
+                    quote_in: quote_spent,
+                    base_locked,
+                });
+            } else {
+                let index = pool.tvl_tranches.length();
+                pool.tvl_tranches.push_back(TvlTranche {
+                    locked: base_out,
+                    total_locked: base_locked,
+                    tvl_target: param,
+                    gate_opened_at_ms: 0,
+                    gate_open: false,
+                    withdrawn: 0,
+                });
+                event::emit(TvlTrancheLockedEvent<Base, Quote> {
+                    pool_id,
+                    index,
+                    tvl_target: param,
+                    quote_in: quote_spent,
+                    base_locked,
+                });
+            };
         };
         i = i + 1;
     };
@@ -951,11 +1006,14 @@ public fun unlock_tranche_time<Base, Quote>(
     let now = clock.timestamp_ms();
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
-    let tranche = pool.borrow_tranche_mut(index);
-    assert!(tranche.kind == LOCK_KIND_TIME, ETrancheLocked);
+    assert!(index < pool.time_tranches.length(), ETrancheNotFound);
+    let tranche = &mut pool.time_tranches[index];
     assert!(now >= tranche.unlock_ts_ms, ETrancheLocked);
-    let unlocked = take_tranche(tranche);
-    event::emit(TrancheUnlockedEvent<Base, Quote> {
+    // A recorded tranche is never zero-valued, so an empty balance means it
+    // has already been drained. That is the `claimed` flag, without the flag.
+    assert!(tranche.locked.value() > 0, ETrancheAlreadyClaimed);
+    let unlocked = tranche.locked.withdraw_all();
+    event::emit(TimeTrancheUnlockedEvent<Base, Quote> {
         pool_id,
         index,
         amount: unlocked.value(),
@@ -1155,23 +1213,35 @@ public fun real_reserves<Base, Quote>(pool: &Pool<Base, Quote>): (u64, u64, u64)
 // `accrued_fees` is gone with the accrual balances: curve fees never rest on
 // the pool. Sum `CurveFeesPaidEvent` for per-pool fee totals.
 
-public fun tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
-    pool.tranches.length()
+public fun time_tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
+    pool.time_tranches.length()
 }
 
-/// Returns `(kind, unlock_ts_ms, tvl_target, locked_amount, claimed)`.
-public fun tranche_info<Base, Quote>(
+public fun tvl_tranche_count<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
+    pool.tvl_tranches.length()
+}
+
+/// Returns `(unlock_ts_ms, locked_amount, claimed)`.
+public fun time_tranche_info<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
-): (u8, u64, u64, u64, bool) {
-    assert!(index < pool.tranches.length(), ETrancheNotFound);
-    let tranche = &pool.tranches[index];
+): (u64, u64, bool) {
+    assert!(index < pool.time_tranches.length(), ETrancheNotFound);
+    let tranche = &pool.time_tranches[index];
+    (tranche.unlock_ts_ms, tranche.locked.value(), tranche.locked.value() == 0)
+}
+
+/// Returns `(tvl_target, locked_amount, fully_claimed)`.
+public fun tvl_tranche_info<Base, Quote>(
+    pool: &Pool<Base, Quote>,
+    index: u64,
+): (u64, u64, bool) {
+    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
+    let tranche = &pool.tvl_tranches[index];
     (
-        tranche.kind,
-        tranche.unlock_ts_ms,
         tranche.tvl_target,
         tranche.locked.value(),
-        tranche.claimed,
+        tranche.withdrawn == tranche.total_locked,
     )
 }
 
@@ -1285,9 +1355,9 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
     let creator = pool.creator;
     let pool_id = pool.id.to_inner();
     let vesting_duration_ms = pool.tvl_vesting_duration_ms;
-    let tranche = pool.borrow_tranche_mut(index);
-    assert!(tranche.kind == LOCK_KIND_TVL, ETrancheLocked);
-    // Deliberately no `!claimed` assert: once the window completes the
+    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
+    let tranche = &mut pool.tvl_tranches[index];
+    // Deliberately no completion assert: once the window completes the
     // arithmetic below yields a zero delta on its own, so a keeper polling
     // every pool keeps getting harmless no-ops instead of permanent aborts.
 
@@ -1309,9 +1379,6 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
         );
         let delta = entitled - tranche.withdrawn;
         tranche.withdrawn = entitled;
-        if (elapsed >= vesting_duration_ms) {
-            tranche.claimed = true;
-        };
         delta
     } else {
         0
@@ -1321,12 +1388,11 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
     let gate_opened_at_ms = tranche.gate_opened_at_ms;
     let released = tranche.locked.split(releasable);
 
-    // Emitted for every non-zero release, exactly as the TIME path does, so
-    // `TrancheUnlockedEvent` remains the ONE event to sum for creator tranche
-    // payouts regardless of lock kind. `migration::TvlTrancheClaimedEvent`
-    // adds the gate and price context on top; it does not replace this.
+    // Only when money actually moves, so summing this event gives creator
+    // payouts directly. The companion `migration::TvlTrancheClaimedEvent`
+    // records the observation itself, including the no-ops.
     if (releasable > 0) {
-        event::emit(TrancheUnlockedEvent<Base, Quote> {
+        event::emit(TvlTrancheReleasedEvent<Base, Quote> {
             pool_id,
             index,
             amount: releasable,
@@ -1339,16 +1405,14 @@ public(package) fun claim_tvl_tranche<Base, Quote>(
 /// Returns `(total_locked, gate_open, gate_opened_at_ms, vesting_duration_ms,
 /// withdrawn)` for a TVL tranche, so a frontend can render release progress.
 ///
-/// TVL-only: the gate and `withdrawn` fields are never written for a TIME
-/// tranche, so reporting them would render a fully-paid TIME tranche as
-/// "nothing released, gate still shut". Use `tranche_info` for those.
-public fun tranche_vesting<Base, Quote>(
+/// The kind assert this once needed is gone: a TIME tranche is not of this
+/// type and cannot reach here.
+public fun tvl_tranche_vesting<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): (u64, bool, u64, u64, u64) {
-    assert!(index < pool.tranches.length(), ETrancheNotFound);
-    let tranche = &pool.tranches[index];
-    assert!(tranche.kind == LOCK_KIND_TVL, ETrancheLocked);
+    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
+    let tranche = &pool.tvl_tranches[index];
     (
         tranche.total_locked,
         tranche.gate_open,
@@ -1362,12 +1426,12 @@ public fun tvl_vesting_duration_ms<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
     pool.tvl_vesting_duration_ms
 }
 
-public(package) fun tranche_tvl_target<Base, Quote>(
+public(package) fun tvl_tranche_target<Base, Quote>(
     pool: &Pool<Base, Quote>,
     index: u64,
 ): u64 {
-    assert!(index < pool.tranches.length(), ETrancheNotFound);
-    pool.tranches[index].tvl_target
+    assert!(index < pool.tvl_tranches.length(), ETrancheNotFound);
+    pool.tvl_tranches[index].tvl_target
 }
 
 
@@ -1381,20 +1445,6 @@ public(package) fun assert_burn_only_currency<Base>(currency: &Currency<Base>) {
 }
 
 // === Internal helpers ===
-
-fun borrow_tranche_mut<Base, Quote>(
-    pool: &mut Pool<Base, Quote>,
-    index: u64,
-): &mut CreatorTranche<Base> {
-    assert!(index < pool.tranches.length(), ETrancheNotFound);
-    &mut pool.tranches[index]
-}
-
-fun take_tranche<Base>(tranche: &mut CreatorTranche<Base>): Balance<Base> {
-    assert!(!tranche.claimed, ETrancheAlreadyClaimed);
-    tranche.claimed = true;
-    tranche.locked.withdraw_all()
-}
 
 /// Single outbound-payment choke point: non-zero value is credited to
 /// the recipient's address balance (funds accumulator) instead of
@@ -1410,8 +1460,15 @@ public(package) fun send_funds<T>(coin: Coin<T>, recipient: address) {
 // === Test helpers ===
 
 #[test_only]
-public fun tranche_locked_event_amounts<Base, Quote>(
-    ev: &TrancheLockedEvent<Base, Quote>,
+public fun time_tranche_locked_event_amounts<Base, Quote>(
+    ev: &TimeTrancheLockedEvent<Base, Quote>,
+): (u64, u64) {
+    (ev.quote_in, ev.base_locked)
+}
+
+#[test_only]
+public fun tvl_tranche_locked_event_amounts<Base, Quote>(
+    ev: &TvlTrancheLockedEvent<Base, Quote>,
 ): (u64, u64) {
     (ev.quote_in, ev.base_locked)
 }
@@ -1425,8 +1482,15 @@ public fun curve_fees_paid_event_amounts<Base, Quote>(
 }
 
 #[test_only]
-public fun tranche_unlocked_event_amount<Base, Quote>(
-    ev: &TrancheUnlockedEvent<Base, Quote>,
+public fun time_tranche_unlocked_event_amount<Base, Quote>(
+    ev: &TimeTrancheUnlockedEvent<Base, Quote>,
+): (u64, address) {
+    (ev.amount, ev.creator)
+}
+
+#[test_only]
+public fun tvl_tranche_released_event_amount<Base, Quote>(
+    ev: &TvlTrancheReleasedEvent<Base, Quote>,
 ): (u64, address) {
     (ev.amount, ev.creator)
 }

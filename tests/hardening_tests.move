@@ -268,7 +268,7 @@ fun oversized_first_buy_clamps_to_cap() {
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        let (_, _, _, locked, _) = pool.tranche_info(0);
+        let (_, locked, _) = pool.time_tranche_info(0);
         assert!(locked == MAX_TIME_BASE); // exactly 3% of supply
         ts::return_shared(pool);
     };
@@ -763,11 +763,12 @@ fun first_buy_caps_are_independent_and_stack() {
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        assert!(pool.tranche_count() == 2);
-        let (kind0, _, _, locked0, _) = pool.tranche_info(0);
-        let (kind1, _, _, locked1, _) = pool.tranche_info(1);
-        assert!(kind0 == pool::lock_kind_time() && locked0 == MAX_TIME_BASE);
-        assert!(kind1 == pool::lock_kind_tvl() && locked1 == MAX_TVL_BASE);
+        // Each kind fills its own budget, in its own vector.
+        assert!(pool.time_tranche_count() == 1 && pool.tvl_tranche_count() == 1);
+        let (_, locked0, _) = pool.time_tranche_info(0);
+        let (_, locked1, _) = pool.tvl_tranche_info(0);
+        assert!(locked0 == MAX_TIME_BASE);
+        assert!(locked1 == MAX_TVL_BASE);
         ts::return_shared(pool);
     };
     clock.destroy_for_testing();
@@ -797,8 +798,8 @@ fun exhausted_cap_skips_later_tranches() {
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
         // One recorded tranche, not three.
-        assert!(pool.tranche_count() == 1);
-        let (_, _, _, locked, _) = pool.tranche_info(0);
+        assert!(pool.time_tranche_count() == 1);
+        let (_, locked, _) = pool.time_tranche_info(0);
         assert!(locked == MAX_TIME_BASE);
         ts::return_shared(pool);
     };
@@ -807,14 +808,17 @@ fun exhausted_cap_skips_later_tranches() {
 }
 
 #[test]
-/// The case that MOTIVATES skipping rather than recording a zero-value
-/// tranche. When the dropped tranche sits in the middle, every later tranche
-/// lands at an on-chain index below its input-vector position. Unlock calls
-/// address the on-chain index, so a client that assumed "my third input is
-/// index 2" would address the wrong tranche — which is why
-/// `execute_tranche_buys` emits `pool.tranches.length()` in
-/// `TrancheLockedEvent` rather than the loop counter.
-fun skipped_tranche_shifts_later_on_chain_indices() {
+/// Per-kind vectors mean a skipped tranche of one kind cannot move the other
+/// kind's indices. Before the split, the two shared one vector, so the TVL
+/// tranche below landed at index 1 -- one position off its input slot,
+/// because the second TIME buy found its cap exhausted and was dropped.
+/// Now it is at TVL index 0 and the skip is invisible to it.
+///
+/// The compaction WITHIN a kind still happens: three TIME buys against an
+/// exhausted cap still collapse to one entry (see
+/// `exhausted_cap_skips_later_tranches`). Splitting bounds the blast radius
+/// of a skip to its own kind; it does not remove skips.
+fun skip_in_one_kind_does_not_shift_the_other() {
     let (mut scenario, clock) = setup_with_caps();
     let unlock_at = 1_000_000 + MIN_LOCK_MS;
     create_returning_change(
@@ -830,13 +834,13 @@ fun skipped_tranche_shifts_later_on_chain_indices() {
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        assert!(pool.tranche_count() == 2);
-        let (kind0, _, _, locked0, _) = pool.tranche_info(0);
-        // Input index 2 lives at ON-CHAIN index 1: the shift is real, and
-        // this is the index the creator must pass to claim it.
-        let (kind1, _, _, locked1, _) = pool.tranche_info(1);
-        assert!(kind0 == pool::lock_kind_time() && locked0 == MAX_TIME_BASE);
-        assert!(kind1 == pool::lock_kind_tvl() && locked1 == MAX_TVL_BASE);
+        assert!(pool.time_tranche_count() == 1);
+        assert!(pool.tvl_tranche_count() == 1);
+        let (_, time_locked, _) = pool.time_tranche_info(0);
+        // Input index 2, TVL index 0: the dropped TIME tranche did not move it.
+        let (_, tvl_locked, _) = pool.tvl_tranche_info(0);
+        assert!(time_locked == MAX_TIME_BASE);
+        assert!(tvl_locked == MAX_TVL_BASE);
         ts::return_shared(pool);
     };
     clock.destroy_for_testing();

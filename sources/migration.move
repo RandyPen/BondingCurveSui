@@ -510,7 +510,7 @@ fun claim_tranche_tvl_internal<Base, Quote>(
     let total_supply = coin_registry::total_supply(currency).destroy_some();
     let market_cap =
         curve::tvl_in_quote(total_supply, 0, sqrt_price_x64, base_is_coin_a);
-    let target = pool::tranche_tvl_target(pool, index);
+    let target = pool::tvl_tranche_target(pool, index);
     // Below target is NOT an error. Once the gate is open the price is
     // irrelevant, and before it opens a failed observation is just a no-op —
     // aborting would make routine claim calls fail for no reason.
