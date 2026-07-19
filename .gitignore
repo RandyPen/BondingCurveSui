@@ -18,3 +18,6 @@ docs/
 scripts/
 # template/ source IS tracked (coin template = contract code); its build/ and
 # Move.lock/Move.toml are covered by the rules above.
+
+# Agent worktrees (transient, created by tooling)
+.claude/worktrees/
