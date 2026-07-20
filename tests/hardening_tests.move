@@ -844,11 +844,13 @@ fun add_quote_rejects_min_threshold_below_floor() {
 
 // === First-buy caps ===
 
-// `init_for_testing` sets both caps to 10_000 bps so the existing tranche
-// tests can use large first-buys, which means the clamp and refund branches
-// of `tranche_buy` are never reached by the rest of the suite. These tests
-// install production-like caps and drive both, so the logic is protected
-// against regression rather than merely correct today.
+// `init_for_testing` sits at `MAX_FIRST_BUY_CAP_BPS` (500/500), so the rest of
+// the suite runs under a legal config rather than the uncapped 10_000/10_000 it
+// once used — but it caps BOTH kinds identically, so nothing there distinguishes
+// the two budgets or pins an exact clamp value. These tests install the
+// production 300/500 split and assert the clamped amounts and the refund
+// exactly, so the per-kind arithmetic is protected against regression rather
+// than merely correct today.
 
 const TIME_CAP_BPS: u64 = 300; // 3% of supply, the production default
 const TVL_CAP_BPS: u64 = 500; // 5% of supply, the production default

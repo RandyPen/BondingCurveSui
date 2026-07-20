@@ -201,12 +201,16 @@ fun create_token_initializes_pool() {
 fun create_token_with_tranches_locks_first_buys() {
     let (mut scenario, mut clock) = setup();
     clock.set_for_testing(1_000_000);
-    let budget = 500_000_000;
+    let budget = 50_000_000;
+    // Both grosses stay well under the 5% per-kind cap, so neither leg is
+    // clamped: this test is about one-of-each-kind, the price progression
+    // between the legs and exact fee accounting. Clamping and its refund are
+    // `hardening_tests::oversized_first_buy_clamps_to_cap`'s subject.
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        option::some(pool::new_time_tranche_request(100_000_000, 1_000_000 + MIN_LOCK_MS)),
-        option::some(pool::new_tvl_tranche_request(200_000_000, 50_000_000_000)),
+        option::some(pool::new_time_tranche_request(10_000_000, 1_000_000 + MIN_LOCK_MS)),
+        option::some(pool::new_tvl_tranche_request(20_000_000, 50_000_000_000)),
         budget,
     );
 
@@ -224,10 +228,12 @@ fun create_token_with_tranches_locks_first_buys() {
         assert!(locked1 > 0 && !claimed1);
         // Second tranche bought at a worse price than the first.
         assert!(locked1 < 2 * locked0);
-        // 1% taken on both tranche buys (300M gross); the fee itself has
+        // 1% taken on both tranche buys (30M gross); the fee itself has
         // already been paid out, so it shows up as what the reserve kept.
+        // Exact only because neither leg clamped — a clamped leg spends less
+        // than its gross.
         let (_, _, quote_reserve) = pool.real_reserves();
-        assert!(quote_reserve == 300_000_000 - 3_000_000);
+        assert!(quote_reserve == 30_000_000 - 300_000);
         ts::return_shared(pool);
     };
 
@@ -235,7 +241,7 @@ fun create_token_with_tranches_locks_first_buys() {
     scenario.next_tx(CREATOR);
     {
         let change = scenario.take_from_sender<Coin<MOCK_QUOTE>>();
-        assert!(change.value() == budget - 300_000_000);
+        assert!(change.value() == budget - 30_000_000);
         scenario.return_to_sender(change);
     };
     end(scenario, clock, currency);

@@ -675,9 +675,12 @@ public fun init_for_testing(ctx: &mut TxContext) {
         tick_spacing: 200,
         min_lock_duration_ms: 24 * 60 * 60 * 1000,
         tvl_target_multiplier: 3,
-        // no caps in tests; existing tranche tests use large first-buys
-        first_buy_time_cap_bps: 10_000,
-        first_buy_tvl_cap_bps: 10_000,
+        // At the ceiling, not above it: this fixture builds the struct directly
+        // and so bypasses `set_launch_params`, which would have rejected the
+        // 10_000/10_000 this used to carry. A fixture that can express a config
+        // production cannot is a fixture that tests a product nobody ships.
+        first_buy_time_cap_bps: MAX_FIRST_BUY_CAP_BPS,
+        first_buy_tvl_cap_bps: MAX_FIRST_BUY_CAP_BPS,
         tvl_vesting_duration_ms: 10 * 24 * 60 * 60 * 1000,
         quotes: table::new(ctx),
         pools: table::new(ctx),
