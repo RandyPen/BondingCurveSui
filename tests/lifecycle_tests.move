@@ -59,9 +59,8 @@ fun setup(): (Scenario, Clock) {
 fun create_test_token(
     scenario: &mut Scenario,
     clock: &Clock,
-    tranche_quote_in: vector<u64>,
-    tranche_lock_kind: vector<u8>,
-    tranche_lock_param: vector<u64>,
+    time_lock: Option<pool::TimeTrancheRequest>,
+    tvl_lock: Option<pool::TvlTrancheRequest>,
     payment_amount: u64,
 ): Currency<ZZZ_BASE> {
     scenario.next_tx(CREATOR);
@@ -79,9 +78,8 @@ fun create_test_token(
         b"".to_string(),
         b"".to_string(),
         b"".to_string(),
-        tranche_quote_in,
-        tranche_lock_kind,
-        tranche_lock_param,
+        time_lock,
+        tvl_lock,
         mocks::mint_quote<MOCK_QUOTE>(payment_amount, scenario.ctx()),
         cetus_config,
         cetus_pools,
@@ -167,7 +165,7 @@ fun end(scenario: Scenario, clock: Clock, currency: Currency<ZZZ_BASE>) {
 fun create_token_initializes_pool() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
 
     // Supply is fixed at I + R and burn-only.
@@ -207,9 +205,8 @@ fun create_token_with_tranches_locks_first_buys() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000, 200_000_000],
-        vector[pool::lock_kind_time(), pool::lock_kind_tvl()],
-        vector[1_000_000 + MIN_LOCK_MS, 50_000_000_000],
+        option::some(pool::new_time_tranche_request(100_000_000, 1_000_000 + MIN_LOCK_MS)),
+        option::some(pool::new_tvl_tranche_request(200_000_000, 50_000_000_000)),
         budget,
     );
 
@@ -251,7 +248,7 @@ fun create_token_rejects_unlisted_quote() {
     let clock = clock::create_for_testing(scenario.ctx());
     // No add_quote: creation must abort.
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     end(scenario, clock, currency);
 }
@@ -266,12 +263,12 @@ fun create_token_rejects_unlisted_quote() {
 fun create_token_rejects_duplicate_base() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     // ZZZ_BASE registered already; a second launch with the same base
     // type must abort even though this is a fresh cap/currency.
     let currency2 = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     unit_test::destroy(currency2);
     end(scenario, clock, currency);
@@ -295,9 +292,8 @@ fun create_token_rejects_wrong_creation_fee() {
         b"".to_string(),
         b"".to_string(),
         b"".to_string(),
-        vector[],
-        vector[],
-        vector[],
+        option::none(),
+        option::none(),
         mocks::mint_quote<MOCK_QUOTE>(0, scenario.ctx()),
         cetus_config,
         cetus_pools,
@@ -310,20 +306,6 @@ fun create_token_rejects_wrong_creation_fee() {
     end(scenario, clock, currency);
 }
 
-#[test, expected_failure(abort_code = pool::ETrancheVectorMismatch)]
-fun create_token_rejects_ragged_tranche_vectors() {
-    let (mut scenario, clock) = setup();
-    let currency = create_test_token(
-        &mut scenario,
-        &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[], // missing param
-        100_000_000,
-    );
-    end(scenario, clock, currency);
-}
-
 #[test, expected_failure(abort_code = pool::EInvalidLockParam)]
 fun create_token_rejects_past_time_lock() {
     let (mut scenario, mut clock) = setup();
@@ -331,9 +313,8 @@ fun create_token_rejects_past_time_lock() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[5_000_000 + MIN_LOCK_MS - 1], // just below the minimum duration
+        option::some(pool::new_time_tranche_request(100_000_000, 5_000_000 + MIN_LOCK_MS - 1)), // just below the minimum duration
+        option::none(),
         100_000_000,
     );
     end(scenario, clock, currency);
@@ -348,7 +329,7 @@ fun create_token_rejects_past_time_lock() {
 fun referred_buy_pays_out_of_platform_cut() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
 
     let quote_in = 100_000_000;
@@ -372,7 +353,7 @@ fun referred_buy_pays_out_of_platform_cut() {
 fun self_referral_rejected() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as_referred(
         &mut scenario, &clock, TRADER, 100_000_000, 0, option::some(TRADER),
@@ -386,7 +367,7 @@ fun self_referral_rejected() {
 fun buy_and_sell_roundtrip_with_fees() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
 
     let quote_in = 100_000_000; // 100 quote units gross
@@ -425,7 +406,7 @@ fun buy_and_sell_roundtrip_with_fees() {
 fun buy_respects_min_out() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     let (expected, _) = quote_buy_view(&mut scenario, 100_000_000);
     buy_as(&mut scenario, &clock, TRADER, 100_000_000, expected + 1);
@@ -436,7 +417,7 @@ fun buy_respects_min_out() {
 fun buy_rejects_dust() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as(&mut scenario, &clock, TRADER, MIN_BUY - 1, 0);
     end(scenario, clock, currency);
@@ -446,7 +427,7 @@ fun buy_rejects_dust() {
 fun sell_respects_min_out() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as(&mut scenario, &clock, TRADER, 100_000_000, 0);
     let (expected, _) = quote_sell_view(&mut scenario);
@@ -478,7 +459,7 @@ fun quote_sell_view(scenario: &mut Scenario): (u64, u64) {
 fun completing_buy_drains_curve_and_returns_change() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
 
     // Pay far more than the threshold: the drain clamp must cap the
@@ -507,7 +488,7 @@ fun completing_buy_drains_curve_and_returns_change() {
 fun buy_blocked_after_completion() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as(&mut scenario, &clock, TRADER, 10_000_000_000, 0);
     buy_as(&mut scenario, &clock, TRADER, 100_000_000, 0);
@@ -518,7 +499,7 @@ fun buy_blocked_after_completion() {
 fun sell_blocked_after_completion() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as(&mut scenario, &clock, TRADER, 10_000_000_000, 0);
     sell_as(&mut scenario, TRADER, 0);
@@ -533,9 +514,8 @@ fun creator_tranches_can_drain_whole_curve() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[4_000_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(4_000_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         4_000_000_000,
     );
     // The completing tranche buy leaves change: the event must report
@@ -565,7 +545,7 @@ fun creator_tranches_can_drain_whole_curve() {
 fun pause_blocks_buys() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(ADMIN);
     {
@@ -583,7 +563,7 @@ fun pause_blocks_buys() {
 fun pause_does_not_block_sells() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     buy_as(&mut scenario, &clock, TRADER, 100_000_000, 0);
     scenario.next_tx(ADMIN);
@@ -609,7 +589,7 @@ fun pause_does_not_block_sells() {
 fun curve_fees_are_paid_within_the_trade() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     let quote_in = 100_000_000;
     buy_as(&mut scenario, &clock, TRADER, quote_in, 0);
@@ -639,9 +619,8 @@ fun time_tranche_unlocks_at_boundary() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(100_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         100_000_000,
     );
 
@@ -673,9 +652,8 @@ fun time_tranche_locked_before_boundary() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(100_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         100_000_000,
     );
     clock.set_for_testing(1_000 + MIN_LOCK_MS - 1);
@@ -697,9 +675,8 @@ fun tranche_cannot_be_claimed_twice() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(100_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         100_000_000,
     );
     clock.set_for_testing(2_000 + MIN_LOCK_MS);
@@ -721,7 +698,7 @@ fun tranche_cannot_be_claimed_twice() {
 fun creator_can_update_project_info() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -777,7 +754,7 @@ fun transfer_creator_role(scenario: &mut Scenario) {
 fun creator_can_transfer_role() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     transfer_creator_role(&mut scenario);
     // The settings rights follow the role.
@@ -806,7 +783,7 @@ fun creator_can_transfer_role() {
 fun creator_keeps_rights_while_nomination_pending() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -835,7 +812,7 @@ fun creator_keeps_rights_while_nomination_pending() {
 fun nominee_has_no_rights_while_pending() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -869,7 +846,7 @@ fun nominee_has_no_rights_while_pending() {
 fun old_creator_loses_rights_after_transfer() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     transfer_creator_role(&mut scenario);
     scenario.next_tx(CREATOR);
@@ -896,7 +873,7 @@ fun old_creator_loses_rights_after_transfer() {
 fun non_creator_cannot_nominate() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(TRADER);
     {
@@ -913,7 +890,7 @@ fun non_creator_cannot_nominate() {
 fun accept_requires_matching_nomination() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -938,7 +915,7 @@ fun accept_requires_matching_nomination() {
 fun cancelled_nomination_cannot_be_accepted() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -968,9 +945,8 @@ fun tranche_unlock_pays_new_creator_after_transfer() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(100_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         100_000_000,
     );
     transfer_creator_role(&mut scenario);
@@ -997,7 +973,7 @@ fun tranche_unlock_pays_new_creator_after_transfer() {
 fun project_info_rejects_oversized_link() {
     let (mut scenario, clock) = setup();
     let currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -1030,7 +1006,7 @@ fun project_info_rejects_oversized_link() {
 fun creator_can_update_metadata() {
     let (mut scenario, clock) = setup();
     let mut currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(CREATOR);
     {
@@ -1059,7 +1035,7 @@ fun creator_can_update_metadata() {
 fun non_creator_cannot_update_metadata() {
     let (mut scenario, clock) = setup();
     let mut currency = create_test_token(
-        &mut scenario, &clock, vector[], vector[], vector[], 0,
+        &mut scenario, &clock, option::none(), option::none(), 0,
     );
     scenario.next_tx(TRADER);
     {
@@ -1093,9 +1069,8 @@ fun time_unlock_cannot_reach_a_tvl_tranche() {
     let currency = create_test_token(
         &mut scenario,
         &clock,
-        vector[100_000_000],
-        vector[pool::lock_kind_tvl()],
-        vector[50_000_000_000],
+        option::none(),
+        option::some(pool::new_tvl_tranche_request(100_000_000, 50_000_000_000)),
         100_000_000,
     );
     clock.set_for_testing(99_000_000);

@@ -54,9 +54,8 @@ fun try_create(
     scenario: &mut Scenario,
     clock: &Clock,
     threshold: Option<u64>,
-    tranche_quote_in: vector<u64>,
-    tranche_lock_kind: vector<u8>,
-    tranche_lock_param: vector<u64>,
+    time_lock: Option<pool::TimeTrancheRequest>,
+    tvl_lock: Option<pool::TvlTrancheRequest>,
     payment: u64,
     _tamper: u8,
 ) {
@@ -75,9 +74,8 @@ fun try_create(
         b"".to_string(),
         b"".to_string(),
         b"".to_string(),
-        tranche_quote_in,
-        tranche_lock_kind,
-        tranche_lock_param,
+        time_lock,
+        tvl_lock,
         mocks::mint_quote<MOCK_QUOTE>(payment, scenario.ctx()),
         cetus_config,
         cetus_pools,
@@ -108,9 +106,8 @@ fun create_accepts_custom_threshold() {
         &mut scenario,
         &clock,
         option::some(MIN_THRESHOLD),
-        vector[],
-        vector[],
-        vector[],
+        option::none(),
+        option::none(),
         0,
         0,
     );
@@ -131,9 +128,8 @@ fun create_rejects_threshold_below_minimum() {
         &mut scenario,
         &clock,
         option::some(MIN_THRESHOLD - 1),
-        vector[],
-        vector[],
-        vector[],
+        option::none(),
+        option::none(),
         0,
         0,
     );
@@ -217,40 +213,46 @@ fun set_launch_params_rejects_overflowing_virtual_reserve() {
 
 // === Tranche validation ===
 
-#[test, expected_failure(abort_code = pool::ETooManyTranches)]
-fun create_rejects_too_many_tranches() {
-    let (mut scenario, mut clock) = setup();
-    clock.set_for_testing(1_000);
-    let mut quote_in = vector[];
-    let mut kinds = vector[];
-    let mut params = vector[];
-    let mut i = 0u64;
-    while (i < 3) {
-        quote_in.push_back(1_000_000);
-        kinds.push_back(pool::lock_kind_time());
-        params.push_back(1_000 + MIN_LOCK_MS);
-        i = i + 1;
-    };
-    try_create(&mut scenario, &clock, option::none(), quote_in, kinds, params, 20_000_000, 0);
-    clock.destroy_for_testing();
-    scenario.end();
+// The former `create_rejects_too_many_tranches`, `create_rejects_unknown_lock_kind`,
+// `create_rejects_two_time_tranches` and `create_rejects_two_tvl_tranches` tests were
+// removed along with the three parallel `tranche_*` vectors they policed. A launch now
+// passes at most one typed request per lock kind, so an over-long list, an unknown kind
+// byte and a repeated kind are all unrepresentable rather than runtime-rejected — there
+// is no call left to write. `create_rejects_incomplete_lock_request` below covers the
+// one malformed input the flattened `entry` signature can still express.
+
+// `create_token_entry` must flatten each request into an `Option<u64>` pair, because
+// Sui's entry-point verifier takes only objects and pure types. That reintroduces one
+// state the typed API cannot hold — half a lock — so `new_tranche_requests` rejects it
+// there, and these two tests hit each of its asserts. They call the helper directly:
+// `create_token_entry` is a private `entry fun` and no other module can reach it.
+
+#[test, expected_failure(abort_code = pool::EIncompleteLockRequest)]
+fun create_rejects_incomplete_lock_request() {
+    // A time amount with no unlock timestamp: silently dropping it would spend
+    // the creator's quote on an unlocked buy.
+    let (time_lock, tvl_lock) = pool::new_tranche_requests(
+        option::some(1_000_000),
+        option::none(),
+        option::none(),
+        option::none(),
+    );
+    time_lock.destroy_none();
+    tvl_lock.destroy_none();
 }
 
-#[test, expected_failure(abort_code = pool::EInvalidLockKind)]
-fun create_rejects_unknown_lock_kind() {
-    let (mut scenario, clock) = setup();
-    try_create(
-        &mut scenario,
-        &clock,
+#[test, expected_failure(abort_code = pool::EIncompleteLockRequest)]
+fun create_rejects_incomplete_tvl_lock_request() {
+    // The mirror case, and the other half of the rule: a market-cap target
+    // with nothing funding it.
+    let (time_lock, tvl_lock) = pool::new_tranche_requests(
         option::none(),
-        vector[1_000_000],
-        vector[7],
-        vector[1],
-        1_000_000,
-        0,
+        option::none(),
+        option::none(),
+        option::some(50_000_000_000),
     );
-    clock.destroy_for_testing();
-    scenario.end();
+    time_lock.destroy_none();
+    tvl_lock.destroy_none();
 }
 
 #[test, expected_failure(abort_code = pool::EInvalidLockParam)]
@@ -260,9 +262,8 @@ fun create_rejects_zero_tvl_target() {
         &mut scenario,
         &clock,
         option::none(),
-        vector[1_000_000],
-        vector[pool::lock_kind_tvl()],
-        vector[0],
+        option::none(),
+        option::some(pool::new_tvl_tranche_request(1_000_000, 0)),
         1_000_000,
         0,
     );
@@ -278,9 +279,8 @@ fun create_rejects_underfunded_tranches() {
         &mut scenario,
         &clock,
         option::none(),
-        vector[10_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(10_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         9_999_999, // one short
         0,
     );
@@ -295,9 +295,8 @@ fun create_rejects_tvl_target_below_minimum() {
         &mut scenario,
         &clock,
         option::none(),
-        vector[1_000_000],
-        vector[pool::lock_kind_tvl()],
-        vector[MIN_TVL_TARGET - 1],
+        option::none(),
+        option::some(pool::new_tvl_tranche_request(1_000_000, MIN_TVL_TARGET - 1)),
         1_000_000,
         0,
     );
@@ -330,9 +329,8 @@ fun oversized_first_buy_clamps_to_cap() {
     let change = create_returning_change(
         &mut scenario,
         &clock,
-        vector[2_000_000_000],
-        vector[pool::lock_kind_time()],
-        vector[1_000 + MIN_LOCK_MS],
+        option::some(pool::new_time_tranche_request(2_000_000_000, 1_000 + MIN_LOCK_MS)),
+        option::none(),
         2_000_100_000,
     );
     // The refund half of the claim above, which previously went unasserted:
@@ -417,7 +415,7 @@ fun disabled_quote_rejects_new_launches() {
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
-    try_create(&mut scenario, &clock, option::none(), vector[], vector[], vector[], 0, 0);
+    try_create(&mut scenario, &clock, option::none(), option::none(), option::none(), 0, 0);
     clock.destroy_for_testing();
     scenario.end();
 }
@@ -425,7 +423,7 @@ fun disabled_quote_rejects_new_launches() {
 #[test]
 fun disabling_quote_does_not_affect_live_pools() {
     let (mut scenario, clock) = setup();
-    try_create(&mut scenario, &clock, option::none(), vector[], vector[], vector[], 0, 0);
+    try_create(&mut scenario, &clock, option::none(), option::none(), option::none(), 0, 0);
     scenario.next_tx(ADMIN);
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
@@ -582,9 +580,8 @@ fun complete_with_tvl_tranche(scenario: &mut Scenario, clock: &Clock) {
         scenario,
         clock,
         option::none(),
-        vector[100_000_000],
-        vector[pool::lock_kind_tvl()],
-        vector[50_000_000_000],
+        option::none(),
+        option::some(pool::new_tvl_tranche_request(100_000_000, 50_000_000_000)),
         100_000_000,
         0,
     );
@@ -765,11 +762,10 @@ fun add_quote_rejects_min_threshold_below_floor() {
 // === First-buy caps ===
 
 // `init_for_testing` sets both caps to 10_000 bps so the existing tranche
-// tests can use large first-buys, which means the clamp, refund and
-// skip-exhausted branches of `execute_tranche_buys` are never reached by the
-// rest of the suite. These tests install production-like caps and drive all
-// three, so the logic is protected against regression rather than merely
-// correct today.
+// tests can use large first-buys, which means the clamp and refund branches
+// of `tranche_buy` are never reached by the rest of the suite. These tests
+// install production-like caps and drive both, so the logic is protected
+// against regression rather than merely correct today.
 
 const TIME_CAP_BPS: u64 = 300; // 3% of supply, the production default
 const TVL_CAP_BPS: u64 = 500; // 5% of supply, the production default
@@ -802,9 +798,8 @@ fun setup_with_caps(): (Scenario, Clock) {
 fun create_returning_change(
     scenario: &mut Scenario,
     clock: &Clock,
-    tranche_quote_in: vector<u64>,
-    tranche_lock_kind: vector<u8>,
-    tranche_lock_param: vector<u64>,
+    time_lock: Option<pool::TimeTrancheRequest>,
+    tvl_lock: Option<pool::TvlTrancheRequest>,
     payment: u64,
 ): u64 {
     scenario.next_tx(CREATOR);
@@ -822,9 +817,8 @@ fun create_returning_change(
         b"".to_string(),
         b"".to_string(),
         b"".to_string(),
-        tranche_quote_in,
-        tranche_lock_kind,
-        tranche_lock_param,
+        time_lock,
+        tvl_lock,
         mocks::mint_quote<MOCK_QUOTE>(payment, scenario.ctx()),
         cetus_config,
         cetus_pools,
@@ -847,9 +841,8 @@ fun first_buy_caps_are_independent_and_stack() {
     create_returning_change(
         &mut scenario,
         &clock,
-        vector[OVERSIZED_BUY, OVERSIZED_BUY],
-        vector[pool::lock_kind_time(), pool::lock_kind_tvl()],
-        vector[1_000_000 + MIN_LOCK_MS, 50_000_000_000],
+        option::some(pool::new_time_tranche_request(OVERSIZED_BUY, 1_000_000 + MIN_LOCK_MS)),
+        option::some(pool::new_tvl_tranche_request(OVERSIZED_BUY, 50_000_000_000)),
         2 * OVERSIZED_BUY,
     );
     scenario.next_tx(CREATOR);
@@ -864,47 +857,6 @@ fun first_buy_caps_are_independent_and_stack() {
         assert!(locked1 == MAX_TVL_BASE);
         ts::return_shared(pool);
     };
-    clock.destroy_for_testing();
-    scenario.end();
-}
-
-#[test, expected_failure(abort_code = pool::ETooManyTranches)]
-/// A pool holds at most ONE time tranche. Two in the same launch is rejected
-/// outright rather than merged or silently dropped — the singleton dynamic
-/// field is the whole record, so a second one has nowhere to go.
-///
-/// The vector is length 2, so `MAX_TRANCHES` is satisfied and the per-kind
-/// uniqueness assert is what fires (`create_rejects_too_many_tranches`
-/// covers the length bound separately).
-fun create_rejects_two_time_tranches() {
-    let (mut scenario, clock) = setup_with_caps();
-    let unlock_at = 1_000_000 + MIN_LOCK_MS;
-    create_returning_change(
-        &mut scenario,
-        &clock,
-        vector[OVERSIZED_BUY, OVERSIZED_BUY],
-        vector[pool::lock_kind_time(), pool::lock_kind_time()],
-        vector[unlock_at, unlock_at],
-        2 * OVERSIZED_BUY,
-    );
-    clock.destroy_for_testing();
-    scenario.end();
-}
-
-#[test, expected_failure(abort_code = pool::ETooManyTranches)]
-/// Uniqueness is enforced per kind, not just for TIME: a second TVL tranche
-/// is rejected the same way. `first_buy_caps_are_independent_and_stack`
-/// covers the allowed combination (one of each).
-fun create_rejects_two_tvl_tranches() {
-    let (mut scenario, clock) = setup_with_caps();
-    create_returning_change(
-        &mut scenario,
-        &clock,
-        vector[OVERSIZED_BUY, OVERSIZED_BUY],
-        vector[pool::lock_kind_tvl(), pool::lock_kind_tvl()],
-        vector[50_000_000_000, 50_000_000_000],
-        2 * OVERSIZED_BUY,
-    );
     clock.destroy_for_testing();
     scenario.end();
 }

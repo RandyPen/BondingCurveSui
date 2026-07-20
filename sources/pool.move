@@ -39,12 +39,8 @@ const EDecimalsMismatch: u64 = 5;
 // Code 6 (EMetadataCapClaimed) retired: `seal` claims the MetadataCap itself
 // (via finalize) and hands it to `create_token` in the FactoryReceipt, so there
 // is no external metadata-cap-claim race to guard against.
-/// Tranche parameter vectors have different lengths.
-const ETrancheVectorMismatch: u64 = 7;
-/// More than one first-buy tranche of a given lock kind.
-const ETooManyTranches: u64 = 8;
-/// Unknown tranche lock kind.
-const EInvalidLockKind: u64 = 9;
+/// A first-buy tranche of this lock kind is already recorded on the pool.
+const ETrancheAlreadyExists: u64 = 8;
 /// Lock parameter invalid (time not in the future / zero TVL target).
 const EInvalidLockParam: u64 = 10;
 /// Output below the caller's slippage bound.
@@ -81,14 +77,18 @@ const ENotPendingCreator: u64 = 26;
 /// No creator nomination is pending.
 const ENoPendingCreator: u64 = 27;
 /// A trade named its own sender as the referrer.
+///
+/// Code 28 was previously ETrancheExceedsCap (an over-cap first-buy now clamps
+/// to the cap and refunds the excess instead of aborting) and was REUSED rather
+/// than retired, so a client still mapping 28 to the old meaning mislabels this.
+/// Renumbering now would only move the ambiguity, so the number stands.
 const ESelfReferral: u64 = 28;
-// Code 28 (ETrancheExceedsCap) retired: an over-cap first-buy is now clamped to
-// the cap with the excess quote refunded, rather than aborting.
+/// A first-buy lock was half-specified: its quote amount and its unlock
+/// condition must be supplied together, or neither.
+const EIncompleteLockRequest: u64 = 29;
 
 // === Constants ===
 
-/// At most one TIME and one TVL first-buy per pool.
-const MAX_TRANCHES: u64 = 2;
 /// Sentinel passed to `buy_internal` for public buys: no first-buy cap (only
 /// the curve-completion clamp applies).
 const NO_FIRST_BUY_CAP: u64 = 0xffff_ffff_ffff_ffff;
@@ -99,10 +99,6 @@ const MAX_LINK_LEN: u64 = 500;
 const PHASE_TRADING: u8 = 0;
 const PHASE_COMPLETED: u8 = 1;
 const PHASE_MIGRATED: u8 = 2;
-
-// Creator-tranche lock kinds.
-const LOCK_KIND_TIME: u8 = 0;
-const LOCK_KIND_TVL: u8 = 1;
 
 /// Platform base-coin decimals, hard-coded into `seal` (never a caller/template
 /// parameter). Must equal `LaunchpadConfig.base_decimals` so `create_token`
@@ -117,9 +113,9 @@ public struct MetadataCapKey has copy, drop, store {}
 // Dynamic-field keys for creator tranches, one SINGLETON per lock kind.
 //
 // A pool has at most one TIME tranche and at most one TVL tranche, so the
-// keys carry no index: the key type IS the identity. `execute_tranche_buys`
-// is the sole writer and rejects a second tranche of either kind, which also
-// means the same launch cannot register a lock twice.
+// keys carry no index: the key type IS the identity. `lock_time_tranche` and
+// `lock_tvl_tranche` are the sole writers, and `create_token` reaches each at
+// most once because a launch supplies at most one request per kind.
 //
 // They live in dynamic fields rather than inline pool fields because the
 // trade path never reads them: `buy` and `sell` load and write the whole
@@ -174,7 +170,7 @@ public struct ProjectInfo has store, copy, drop {
 /// A flash pump therefore buys notice-then-a-slow-drip, never a dump.
 /// A time-locked creator first-buy: a cliff. Nothing to track but the
 /// balance and when it opens — "already claimed" is `locked.value() == 0`,
-/// which is unambiguous because `execute_tranche_buys` never records a
+/// which is unambiguous because `lock_time_tranche` never records a
 /// zero-value tranche.
 public struct TimeTranche<phantom Base> has store {
     locked: Balance<Base>,
@@ -199,6 +195,35 @@ public struct TvlTranche<phantom Base> has store {
     gate_open: bool,
     /// Cumulative amount already released, so each call pays only the delta.
     withdrawn: u64,
+}
+
+// What a launch ASKS for, as opposed to what the pool ends up storing above.
+//
+// One optional request per lock kind is the whole input domain, so the kind is
+// the TYPE rather than a discriminant byte travelling beside an untyped
+// parameter. That is what makes a market cap in a timestamp's slot, a third
+// lock kind, and a second tranche of one kind unrepresentable rather than
+// merely rejected.
+//
+// Deliberately ability-less: not `copy`, so one request cannot fund two
+// launches; not `drop`, so `create_token` consuming it exactly once is a
+// compiler fact rather than a convention; not `key`, which would make them
+// legal `entry` parameters and defeat `create_token_entry`'s flattening.
+// Field names mirror `TimeTranche` / `TvlTranche` so request, stored record
+// and event line up textually.
+
+/// A requested time-locked creator first-buy.
+public struct TimeTrancheRequest {
+    /// Gross quote to spend, fee inclusive.
+    quote_in: u64,
+    unlock_ts_ms: u64,
+}
+
+/// A requested market-cap-gated creator first-buy.
+public struct TvlTrancheRequest {
+    /// Gross quote to spend, fee inclusive.
+    quote_in: u64,
+    tvl_target: u64,
 }
 
 public struct Pool<phantom Base, phantom Quote> has key {
@@ -447,6 +472,17 @@ public fun new_sealed_base_for_testing<T: drop>(
 /// creator first-buy tranches, and shares the pool. Returns the change
 /// from `payment`.
 ///
+/// At most one first-buy per lock kind, each optional and independent. When
+/// both are present the TIME leg buys FIRST: both spend against the same
+/// rising curve, so the order decides which leg gets the cheaper tokens, and
+/// it is fixed here rather than left to the caller.
+///
+/// PTB callers should prefer `create_token_entry`, which takes the same
+/// requests as flat `Option<u64>` pairs. Reaching this function from a PTB
+/// means chaining `new_time_tranche_request` / `new_tvl_tranche_request` and
+/// `0x1::option::some`, and the requests carry no `drop`, so an unconsumed
+/// intermediate aborts the transaction.
+///
 /// Note: the quote coin must be in Cetus's allowed-pair config for the
 /// configured tick_spacing (SUI at 200 by default; other quotes need
 /// Cetus's pool manager to allow them), otherwise this aborts.
@@ -460,9 +496,8 @@ public fun create_token<Base, Quote>(
     twitter: String,
     telegram: String,
     website: String,
-    tranche_quote_in: vector<u64>,
-    tranche_lock_kind: vector<u8>,
-    tranche_lock_param: vector<u64>,
+    time_lock: Option<TimeTrancheRequest>,
+    tvl_lock: Option<TvlTrancheRequest>,
     mut payment: Coin<Quote>,
     cetus_config: &CetusGlobalConfig,
     cetus_pools: &mut CetusPools,
@@ -582,20 +617,38 @@ public fun create_token<Base, Quote>(
     let supply = ((initial_base + remain_base) as u128);
     let max_time_base = ((supply * (cfg.first_buy_time_cap_bps() as u128) / 10_000) as u64);
     let max_tvl_base = ((supply * (cfg.first_buy_tvl_cap_bps() as u128) / 10_000) as u64);
-    execute_tranche_buys(
-        &mut pool,
-        tranche_quote_in,
-        tranche_lock_kind,
-        tranche_lock_param,
-        &mut payment,
-        cfg.min_lock_duration_ms(),
-        quote_params.quote_min_tvl_target(),
-        min_mcap_target,
-        max_time_base,
-        max_tvl_base,
-        cfg.treasury(),
-        clock,
-    );
+    // TIME before TVL: see the order note on this function's doc comment.
+    if (time_lock.is_some()) {
+        let TimeTrancheRequest { quote_in, unlock_ts_ms } = time_lock.destroy_some();
+        lock_time_tranche(
+            &mut pool,
+            quote_in,
+            unlock_ts_ms,
+            &mut payment,
+            cfg.min_lock_duration_ms(),
+            max_time_base,
+            cfg.treasury(),
+            clock,
+        );
+    } else {
+        time_lock.destroy_none()
+    };
+    if (tvl_lock.is_some()) {
+        let TvlTrancheRequest { quote_in, tvl_target } = tvl_lock.destroy_some();
+        lock_tvl_tranche(
+            &mut pool,
+            quote_in,
+            tvl_target,
+            &mut payment,
+            quote_params.quote_min_tvl_target(),
+            min_mcap_target,
+            max_tvl_base,
+            cfg.treasury(),
+            clock,
+        );
+    } else {
+        tvl_lock.destroy_none()
+    };
 
     config::register_pool(cfg, type_name::with_defining_ids<Base>(), pool_id);
     transfer::share_object(pool);
@@ -603,6 +656,11 @@ public fun create_token<Base, Quote>(
 }
 
 /// CLI-friendly wrapper: change from `payment` is returned to the sender.
+///
+/// Takes the two first-buy requests FLATTENED into `Option<u64>` pairs,
+/// because Sui's entry-point verifier accepts only objects and pure types —
+/// an ability-less struct is not a legal `entry` parameter. Pass both halves
+/// of a pair or neither; see `new_tranche_requests`.
 entry fun create_token_entry<Base, Quote>(
     cfg: &mut LaunchpadConfig,
     currency: &mut Currency<Base>,
@@ -613,15 +671,22 @@ entry fun create_token_entry<Base, Quote>(
     twitter: String,
     telegram: String,
     website: String,
-    tranche_quote_in: vector<u64>,
-    tranche_lock_kind: vector<u8>,
-    tranche_lock_param: vector<u64>,
+    time_lock_quote_in: Option<u64>,
+    time_lock_unlock_ts_ms: Option<u64>,
+    tvl_lock_quote_in: Option<u64>,
+    tvl_lock_target: Option<u64>,
     payment: Coin<Quote>,
     cetus_config: &CetusGlobalConfig,
     cetus_pools: &mut CetusPools,
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
+    let (time_lock, tvl_lock) = new_tranche_requests(
+        time_lock_quote_in,
+        time_lock_unlock_ts_ms,
+        tvl_lock_quote_in,
+        tvl_lock_target,
+    );
     let change = create_token<Base, Quote>(
         cfg,
         currency,
@@ -632,9 +697,8 @@ entry fun create_token_entry<Base, Quote>(
         twitter,
         telegram,
         website,
-        tranche_quote_in,
-        tranche_lock_kind,
-        tranche_lock_param,
+        time_lock,
+        tvl_lock,
         payment,
         cetus_config,
         cetus_pools,
@@ -644,119 +708,191 @@ entry fun create_token_entry<Base, Quote>(
     send_funds(change, ctx.sender());
 }
 
-fun execute_tranche_buys<Base, Quote>(
+/// Builds a time-locked first-buy request. `quote_in` is the gross quote to
+/// spend (the curve fee comes out of it); `unlock_ts_ms` must be at least
+/// `min_lock_duration_ms` in the future, checked at launch.
+public fun new_time_tranche_request(quote_in: u64, unlock_ts_ms: u64): TimeTrancheRequest {
+    TimeTrancheRequest { quote_in, unlock_ts_ms }
+}
+
+/// Builds a market-cap-gated first-buy request. `tvl_target` is a post-migration
+/// CLMM market cap in quote units, floored at launch by both the per-quote
+/// minimum and a multiple of the launch's own graduation market cap.
+public fun new_tvl_tranche_request(quote_in: u64, tvl_target: u64): TvlTrancheRequest {
+    TvlTrancheRequest { quote_in, tvl_target }
+}
+
+/// Reassembles the flat `Option<u64>` pairs an `entry` signature is limited to
+/// back into typed requests.
+///
+/// This is the ONLY place a half-specified lock can be expressed, and it is
+/// where that is rejected: an amount without a condition (or the reverse) is a
+/// caller mistake, not a lock. It deliberately does NOT check the amounts —
+/// `tranche_buy` owns `EBelowMinBuy` — so each rule keeps one home.
+///
+/// `public(package)` rather than private so tests can reach the pairing rule;
+/// `create_token_entry` is a private `entry fun` and cannot be called from
+/// another module, which would otherwise leave this assert with no coverage.
+public(package) fun new_tranche_requests(
+    time_lock_quote_in: Option<u64>,
+    time_lock_unlock_ts_ms: Option<u64>,
+    tvl_lock_quote_in: Option<u64>,
+    tvl_lock_target: Option<u64>,
+): (Option<TimeTrancheRequest>, Option<TvlTrancheRequest>) {
+    assert!(
+        time_lock_quote_in.is_some() == time_lock_unlock_ts_ms.is_some(),
+        EIncompleteLockRequest,
+    );
+    assert!(
+        tvl_lock_quote_in.is_some() == tvl_lock_target.is_some(),
+        EIncompleteLockRequest,
+    );
+    let time_lock = if (time_lock_quote_in.is_some()) {
+        option::some(new_time_tranche_request(
+            time_lock_quote_in.destroy_some(),
+            time_lock_unlock_ts_ms.destroy_some(),
+        ))
+    } else {
+        time_lock_quote_in.destroy_none();
+        time_lock_unlock_ts_ms.destroy_none();
+        option::none()
+    };
+    let tvl_lock = if (tvl_lock_quote_in.is_some()) {
+        option::some(new_tvl_tranche_request(
+            tvl_lock_quote_in.destroy_some(),
+            tvl_lock_target.destroy_some(),
+        ))
+    } else {
+        tvl_lock_quote_in.destroy_none();
+        tvl_lock_target.destroy_none();
+        option::none()
+    };
+    (time_lock, tvl_lock)
+}
+
+/// Buys `unlock_ts_ms`-locked base for the creator and records the tranche.
+fun lock_time_tranche<Base, Quote>(
     pool: &mut Pool<Base, Quote>,
-    quote_in: vector<u64>,
-    lock_kind: vector<u8>,
-    lock_param: vector<u64>,
+    gross: u64,
+    unlock_ts_ms: u64,
     payment: &mut Coin<Quote>,
     min_lock_duration_ms: u64,
+    max_time_base: u64,
+    treasury: address,
+    clock: &Clock,
+) {
+    // One tranche per kind. Unreachable from `create_token`, which holds a
+    // `UID` minted a few lines earlier that never escaped and passes at most
+    // one request per kind — so no field can pre-exist. Kept anyway, for the
+    // same reason as the `EZeroOutput` assert in `tranche_buy`: it pins the
+    // singleton invariant at its only writer, so a future second caller (a
+    // "top up your first-buy" entry point, or exposing this `public(package)`)
+    // degrades to a documented abort code instead of `df::add`'s raw framework
+    // abort, which no client error table maps. Note no test can reach it.
+    assert!(!time_tranche_exists(pool), ETrancheAlreadyExists);
+    // Locks must be substantive, not nominal (e.g. now+1ms): the
+    // admin-configured floor applies.
+    assert!(unlock_ts_ms >= clock.timestamp_ms() + min_lock_duration_ms, EInvalidLockParam);
+
+    let (locked, quote_spent) = tranche_buy(pool, gross, payment, max_time_base, treasury, clock);
+    let base_locked = locked.value();
+    let pool_id = pool.id.to_inner();
+    df::add(&mut pool.id, TimeTrancheKey {}, TimeTranche { locked, unlock_ts_ms });
+    event::emit(TimeTrancheLockedEvent<Base, Quote> {
+        pool_id,
+        unlock_ts_ms,
+        quote_in: quote_spent,
+        base_locked,
+    });
+}
+
+/// Buys `tvl_target`-gated base for the creator and records the tranche.
+fun lock_tvl_tranche<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    gross: u64,
+    tvl_target: u64,
+    payment: &mut Coin<Quote>,
     min_tvl_target: u64,
     min_mcap_target: u128,
-    max_time_base: u64,
     max_tvl_base: u64,
     treasury: address,
     clock: &Clock,
 ) {
-    let count = quote_in.length();
-    assert!(lock_kind.length() == count, ETrancheVectorMismatch);
-    assert!(lock_param.length() == count, ETrancheVectorMismatch);
-    assert!(count <= MAX_TRANCHES, ETooManyTranches);
+    // Unreachable, and kept, for the reason spelled out in `lock_time_tranche`.
+    assert!(!tvl_tranche_exists(pool), ETrancheAlreadyExists);
+    // Locks must be substantive, not nominal (e.g. a market-cap target of 1):
+    // the admin-configured floor and the graduation-relative floor both apply.
+    assert!(tvl_target >= min_tvl_target && tvl_target > 0, EInvalidLockParam);
+    assert!((tvl_target as u128) >= min_mcap_target, EInvalidLockParam);
 
-    let mut i = 0;
-    while (i < count) {
-        let kind = lock_kind[i];
-        let param = lock_param[i];
-        // Locks must be substantive, not nominal (e.g. now+1ms or a
-        // market-cap target of 1): admin-configured floors apply.
-        if (kind == LOCK_KIND_TIME) {
-            // One tranche per kind. The dynamic field is the whole record, so
-            // this is also what stops a launch registering the same lock twice.
-            assert!(!time_tranche_exists(pool), ETooManyTranches);
-            assert!(param >= clock.timestamp_ms() + min_lock_duration_ms, EInvalidLockParam);
-        } else if (kind == LOCK_KIND_TVL) {
-            assert!(!tvl_tranche_exists(pool), ETooManyTranches);
-            assert!(param >= min_tvl_target && param > 0, EInvalidLockParam);
-            assert!((param as u128) >= min_mcap_target, EInvalidLockParam);
-        } else {
-            abort EInvalidLockKind
-        };
+    let (locked, quote_spent) = tranche_buy(pool, gross, payment, max_tvl_base, treasury, clock);
+    let base_locked = locked.value();
+    let pool_id = pool.id.to_inner();
+    df::add(
+        &mut pool.id,
+        TvlTrancheKey {},
+        TvlTranche {
+            locked,
+            total_locked: base_locked,
+            tvl_target,
+            gate_opened_at_ms: 0,
+            gate_open: false,
+            withdrawn: 0,
+        },
+    );
+    event::emit(TvlTrancheLockedEvent<Base, Quote> {
+        pool_id,
+        tvl_target,
+        quote_in: quote_spent,
+        base_locked,
+    });
+}
 
-        let gross = quote_in[i];
-        assert!(gross >= pool.min_buy_amount, EBelowMinBuy);
-        assert!(payment.value() >= gross, EInsufficientPayment);
-        let creator = pool.creator;
-        // First-buy budget for this lock kind. The buy is clamped to it; any
-        // quote beyond what fits under the cap is returned to the creator as
-        // change (rather than aborting the whole launch). TIME and TVL budgets
-        // are separate, so the two kinds stack.
-        let budget = if (kind == LOCK_KIND_TIME) max_time_base else max_tvl_base;
-        let (base_out, change) =
-            // Creator first-buys are never referred.
-            buy_internal(
-                pool,
-                payment.balance_mut().split(gross),
-                creator,
-                budget,
-                option::none(),
-                treasury,
-                clock,
-            );
-        // Cap-clamped (and/or completion-clamped) excess quote returns to payment.
-        let quote_spent = gross - change.value();
-        payment.balance_mut().join(change);
+/// The buy leg shared by both lock kinds: spends up to `gross` from `payment`
+/// under the per-kind first-buy `budget`. Returns `(locked base, quote spent)`.
+fun tranche_buy<Base, Quote>(
+    pool: &mut Pool<Base, Quote>,
+    gross: u64,
+    payment: &mut Coin<Quote>,
+    budget: u64,
+    treasury: address,
+    clock: &Clock,
+): (Balance<Base>, u64) {
+    assert!(gross >= pool.min_buy_amount, EBelowMinBuy);
+    assert!(payment.value() >= gross, EInsufficientPayment);
+    let creator = pool.creator;
+    // The buy is clamped to the budget; any quote beyond what fits under the
+    // cap is returned to the creator as change (rather than aborting the whole
+    // launch). TIME and TVL budgets are separate, so the two kinds stack.
+    let (locked, change) =
+        // Creator first-buys are never referred.
+        buy_internal(
+            pool,
+            payment.balance_mut().split(gross),
+            creator,
+            budget,
+            option::none(),
+            treasury,
+            clock,
+        );
+    // Cap-clamped (and/or completion-clamped) excess quote returns to payment.
+    let quote_spent = gross - change.value();
+    payment.balance_mut().join(change);
 
-        let base_locked = base_out.value();
-        // Unreachable, and asserted rather than skipped so it stays that way.
-        // `buy_internal` clamps to `min(sellable, budget)`: `sellable` is
-        // nonzero because reaching the floor flips the phase to COMPLETED and
-        // the next entry would abort `ENotTrading`, and `budget` is nonzero
-        // because `config` bounds `first_buy_*_cap_bps > 0` and `remain_base
-        // >= MIN_REMAIN_BASE`. That makes the per-kind cap safe WITHOUT the
-        // cumulative accumulators this function used to carry — but only
-        // while `budget > 0` holds, and that is proven a file away. Silently
-        // skipping here would turn a relaxed config bound into a cap BYPASS:
-        // a zero-value first entry adds no dynamic field, so the uniqueness
-        // assert above would let a second entry of the same kind through with
-        // a fresh full budget. Aborting keeps the invariant local.
-        assert!(base_locked > 0, EZeroOutput);
-        {
-            let pool_id = pool.id.to_inner();
-            if (kind == LOCK_KIND_TIME) {
-                df::add(
-                    &mut pool.id,
-                    TimeTrancheKey {},
-                    TimeTranche { locked: base_out, unlock_ts_ms: param },
-                );
-                event::emit(TimeTrancheLockedEvent<Base, Quote> {
-                    pool_id,
-                    unlock_ts_ms: param,
-                    quote_in: quote_spent,
-                    base_locked,
-                });
-            } else {
-                df::add(
-                    &mut pool.id,
-                    TvlTrancheKey {},
-                    TvlTranche {
-                        locked: base_out,
-                        total_locked: base_locked,
-                        tvl_target: param,
-                        gate_opened_at_ms: 0,
-                        gate_open: false,
-                        withdrawn: 0,
-                    },
-                );
-                event::emit(TvlTrancheLockedEvent<Base, Quote> {
-                    pool_id,
-                    tvl_target: param,
-                    quote_in: quote_spent,
-                    base_locked,
-                });
-            };
-        };
-        i = i + 1;
-    };
+    // Unreachable, and asserted rather than skipped so it stays that way.
+    // `buy_internal` clamps to `min(sellable, budget)`: `sellable` is nonzero
+    // because reaching the floor flips the phase to COMPLETED and the next
+    // entry would abort `ENotTrading`, and `budget` is nonzero because
+    // `config` bounds `first_buy_*_cap_bps > 0` and `remain_base >=
+    // MIN_REMAIN_BASE`. That makes the per-kind cap safe WITHOUT the
+    // cumulative accumulators this code used to carry — but only while
+    // `budget > 0` holds, and that is proven a file away. Silently skipping
+    // here would turn a relaxed config bound into a cap BYPASS: a zero-value
+    // first entry adds no dynamic field, so the caller's uniqueness assert
+    // would let a second entry of the same kind through with a fresh full
+    // budget. Aborting keeps the invariant local.
+    assert!(locked.value() > 0, EZeroOutput);
+    (locked, quote_spent)
 }
 
 // === Trading ===
@@ -1272,10 +1408,6 @@ public fun referral_bps<Base, Quote>(pool: &Pool<Base, Quote>): u64 {
 }
 
 public fun tick_spacing<Base, Quote>(pool: &Pool<Base, Quote>): u32 { pool.tick_spacing }
-
-public fun lock_kind_time(): u8 { LOCK_KIND_TIME }
-
-public fun lock_kind_tvl(): u8 { LOCK_KIND_TVL }
 
 public fun phase_trading(): u8 { PHASE_TRADING }
 

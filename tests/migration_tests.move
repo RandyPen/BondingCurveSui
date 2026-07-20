@@ -123,14 +123,11 @@ fun launch_and_complete<B: drop>(
     let (receipt, mut currency) = pool::new_sealed_base_for_testing<B>(scenario.ctx());
     {
         let mut cfg = scenario.take_shared<LaunchpadConfig>();
-        let (tranche_in, kinds, params) = if (tvl_target.is_some()) {
-            (
-                vector[100_000_000],
-                vector[pool::lock_kind_tvl()],
-                vector[tvl_target.destroy_some()],
-            )
+        let tvl_lock = if (tvl_target.is_some()) {
+            option::some(pool::new_tvl_tranche_request(100_000_000, tvl_target.destroy_some()))
         } else {
-            (vector[], vector[], vector[])
+            tvl_target.destroy_none();
+            option::none()
         };
         let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
         let change = pool::create_token<B, MOCK_QUOTE>(
@@ -143,9 +140,8 @@ fun launch_and_complete<B: drop>(
             b"".to_string(),
             b"".to_string(),
             b"".to_string(),
-            tranche_in,
-            kinds,
-            params,
+            option::none(),
+            tvl_lock,
             mocks::mint_quote<MOCK_QUOTE>(100_000_000, scenario.ctx()),
             cetus_config,
             cetus_pools,
@@ -541,9 +537,8 @@ fun migrate_rejected_while_trading() {
             b"".to_string(),
             b"".to_string(),
             b"".to_string(),
-            vector[],
-            vector[],
-            vector[],
+            option::none(),
+            option::none(),
             mocks::mint_quote<MOCK_QUOTE>(0, scenario.ctx()),
             cetus_config,
             cetus_pools,
@@ -872,9 +867,8 @@ fun launch_and_complete_above_crossover<B: drop>(
             b"".to_string(),
             b"".to_string(),
             b"".to_string(),
-            vector[],
-            vector[],
-            vector[],
+            option::none(),
+            option::none(),
             mocks::mint_quote<MOCK_QUOTE>(100_000_000, scenario.ctx()),
             cetus_config,
             cetus_pools,
