@@ -43,6 +43,11 @@ const ESeedPriceOutOfEnvelope: u64 = 3;
 /// `migrate_core` for why it is checked rather than assumed.
 const ENVELOPE_GUARD: u128 = 0x1_0000_0000; // 2^32
 
+/// Longest base-coin `icon_url` that may be forwarded into Cetus as the pool
+/// and Position NFT image. An oversized icon is DROPPED, never a reason to
+/// abort — see `position_url` in `migrate_core`.
+const MAX_POSITION_URL_LEN: u64 = 500;
+
 // === Events ===
 
 /// Generic over the coin pair (like TradedEvent) so a per-token indexer
@@ -267,8 +272,27 @@ fun migrate_core<Base, Quote>(
     // `fix_amount_a` is about the Cetus pool's coin A, not about base/quote:
     // it agrees with `fix_base` only when the base coin IS coin A.
     let fix_amount_a = base_is_coin_a == fix_base;
-    // The base coin's icon becomes the Position NFT image.
-    let position_url = coin_registry::icon_url(currency);
+    // The base coin's icon becomes the Cetus pool's `url`, which Cetus copies
+    // into the Position NFT (and into every Position any third party opens on
+    // that pool later). Nothing caps it upstream: `coin_registry::set_icon_url`
+    // is a bare field assignment, and because `coin_registry::icon_url` returns
+    // the String by value, a creator can read-append-write it across several
+    // transactions and grow it until `Currency<Base>` itself nears the object
+    // size limit — far past what a single transaction could pass in.
+    //
+    // Forwarding that verbatim would let a creator brick their own graduation:
+    // a Cetus `Pool` or `Position` that cannot hold the url plus its own fields
+    // aborts `migrate`, and migration is deliberately unpausable with no
+    // emergency withdrawal while `sell` is already closed — the raise would be
+    // stranded for good. So an oversized icon is DROPPED rather than asserted
+    // on: Cetus substitutes `POOL_DEFAULT_URI` for an empty url, and a missing
+    // image is strictly better than an unrecoverable pool.
+    let icon_url = coin_registry::icon_url(currency);
+    let position_url = if (icon_url.length() <= MAX_POSITION_URL_LEN) {
+        icon_url
+    } else {
+        b"".to_string()
+    };
     let (position, base_left, quote_left) = if (base_is_coin_a) {
         let (position, base_left, quote_left) =
             pool_creator::create_pool_v3_with_creation_cap<Base, Quote>(

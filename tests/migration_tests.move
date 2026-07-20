@@ -291,6 +291,115 @@ fun pump_price_inverted(scenario: &mut Scenario, clock: &Clock, cetus_env: &mut 
 
 // === Migration ===
 
+/// A creator can grow `icon_url` past anything a single transaction could
+/// carry — `coin_registry::icon_url` hands back the String by value, so a PTB
+/// can read-append-write it until `Currency<Base>` itself nears the object
+/// size limit. Forwarding that into Cetus would abort `migrate` once the pool
+/// or Position object could no longer hold it, stranding the raise for good:
+/// migration is unpausable, has no emergency withdrawal, and `sell` is already
+/// closed by then. So the oversized icon must be DROPPED, not asserted on.
+#[test]
+fun oversized_icon_is_dropped_instead_of_blocking_migration() {
+    let (mut scenario, clock, mut cetus_env) = setup();
+    let mut currency =
+        launch_and_complete<ZZZ_BASE>(&mut scenario, &clock, &mut cetus_env, option::none());
+
+    // The creator holds the MetadataCap (in the pool) and can rewrite the icon
+    // in any phase, COMPLETED included — i.e. after the raise is locked in.
+    scenario.next_tx(CREATOR);
+    {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let mut huge = b"".to_string();
+        501u64.do!(|_| huge.append(b"x".to_string()));
+        pool::update_base_metadata(
+            &cfg,
+            &pool,
+            &mut currency,
+            option::none(),
+            option::none(),
+            option::some(huge),
+            scenario.ctx(),
+        );
+        ts::return_shared(cfg);
+        ts::return_shared(pool);
+    };
+    assert!(coin_registry::icon_url(&currency).length() == 501);
+
+    // Migration still lands, and Cetus falls back to its own default image
+    // rather than carrying the oversized string.
+    scenario.next_tx(TRADER);
+    let cfg = scenario.take_shared<LaunchpadConfig>();
+    let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+    let position = migration::migrate_for_testing(
+        &cfg,
+        &mut pool,
+        &mut currency,
+        cetus_config,
+        cetus_pools,
+        &clock,
+        scenario.ctx(),
+    );
+    let url = cetus_clmm::position::url(&position);
+    assert!(url != b"x".to_string());
+    assert!(url.length() < 501);
+    assert!(pool.phase() == pool::phase_migrated());
+    ts::return_shared(cfg);
+    ts::return_shared(pool);
+    unit_test::destroy(position);
+
+    end(scenario, clock, cetus_env, currency);
+}
+
+/// The boundary case on the other side: an icon exactly at the cap is still
+/// forwarded verbatim, so the clamp cannot quietly swallow legitimate URLs.
+#[test]
+fun icon_at_the_cap_still_reaches_the_position() {
+    let (mut scenario, clock, mut cetus_env) = setup();
+    let mut currency =
+        launch_and_complete<ZZZ_BASE>(&mut scenario, &clock, &mut cetus_env, option::none());
+
+    scenario.next_tx(CREATOR);
+    {
+        let cfg = scenario.take_shared<LaunchpadConfig>();
+        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+        let mut at_cap = b"".to_string();
+        500u64.do!(|_| at_cap.append(b"y".to_string()));
+        pool::update_base_metadata(
+            &cfg,
+            &pool,
+            &mut currency,
+            option::none(),
+            option::none(),
+            option::some(at_cap),
+            scenario.ctx(),
+        );
+        ts::return_shared(cfg);
+        ts::return_shared(pool);
+    };
+
+    scenario.next_tx(TRADER);
+    let cfg = scenario.take_shared<LaunchpadConfig>();
+    let mut pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
+    let (cetus_config, cetus_pools) = cetus_env.cetus_refs();
+    let position = migration::migrate_for_testing(
+        &cfg,
+        &mut pool,
+        &mut currency,
+        cetus_config,
+        cetus_pools,
+        &clock,
+        scenario.ctx(),
+    );
+    assert!(cetus_clmm::position::url(&position).length() == 500);
+    ts::return_shared(cfg);
+    ts::return_shared(pool);
+    unit_test::destroy(position);
+
+    end(scenario, clock, cetus_env, currency);
+}
+
 #[test]
 fun migrate_straight_order_creates_full_range_pool() {
     let (mut scenario, clock, mut cetus_env) = setup();
