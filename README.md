@@ -97,7 +97,7 @@ Dependency notes are in `Move.toml`: CetusClmm is pinned to exactly what MVR res
 3. **Protocol feature check**: payouts rely on the address-balance (funds accumulator) protocol feature — verify it is enabled on the target network's protocol version before publishing; if it is not, every fee distribution/unlock aborts.
 4. **First actions after publish**: whitelist quotes (`add_quote<SUI>` / `add_quote<USDC>` …); confirm the `tick_spacing=200` fee tier exists in Cetus `GlobalConfig` (mainnet default, 1%); **verify each whitelisted quote is allowed in Cetus `allowed_pair_config` for that tick_spacing** — SUI and USDC confirmed allowed at tick_spacing 200 by the Cetus team (2026-07-07); others require contacting Cetus. Verify on-chain before whitelisting (`factory::is_allowed_coin` / a dry-run `register_permission_pair`).
 5. **On-chain smoke test**: launch a test coin through the 3 transactions → small buys/sells → drain → `migrate` (verify the Cetus pool price and burn proof) → `claim_lp_fees` round trip → `coin_registry::burn` reduces supply.
-6. **Upgrades**: after a package upgrade call `bump_config_version`, and `bump_pool_version` per live pool as needed.
+6. **Upgrades**: after a package upgrade call `bump_config_version` — that single global gate locks out the old package across every pool at once. There is no per-pool version to bump.
 7. **Two mandatory keepers**:
    - Migration keeper: listen for `CurveCompletedEvent` and call `migrate` immediately (frontends can also attach `migrate` to the drain buy atomically);
    - Regulated-marking keeper: watch for newly published frozen `RegulatedCoinMetadata<T>` objects and call `migrate_regulated_state_by_metadata` to permanently mark regulated coins before they can launch.

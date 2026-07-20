@@ -27,6 +27,8 @@ const EBaseAlreadyLaunched: u64 = 7;
 const EThresholdTooLow: u64 = 8;
 /// Calling package's VERSION does not exceed the config's current version.
 const EVersionNotNewer: u64 = 9;
+/// Treasury address is the zero address.
+const EZeroTreasury: u64 = 10;
 
 // === Constants ===
 
@@ -444,8 +446,14 @@ public fun set_tvl_vesting_params(
     event::emit(TvlVestingParamsUpdatedEvent { tvl_vesting_duration_ms });
 }
 
+/// `balance::send_funds` does not reject `@0x0` — the native accumulator
+/// credits the address derived from it, and nobody holds its key. A zero
+/// treasury therefore silently burns every platform fee leg (creation fees,
+/// the platform cut of curve and LP fees, the migration fee) with no abort to
+/// signal the mistake, so reject it here rather than at the payout site.
 public fun set_treasury(_: &AdminCap, cfg: &mut LaunchpadConfig, treasury: address) {
     cfg.assert_version();
+    assert!(treasury != @0x0, EZeroTreasury);
     cfg.treasury = treasury;
     event::emit(TreasuryUpdatedEvent { treasury });
 }

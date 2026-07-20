@@ -637,6 +637,24 @@ fun admin_cap_transfers_only_via_contract_function() {
     scenario.end();
 }
 
+/// `balance::send_funds` credits the accumulator derived from `@0x0` instead
+/// of aborting, so a zero treasury would silently burn every platform fee leg
+/// with no on-chain signal. The setter is the only place that can catch it.
+#[test, expected_failure(abort_code = config::EZeroTreasury)]
+fun set_treasury_rejects_zero_address() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_treasury(&admin_cap, &mut cfg, @0x0);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
 // === Version gate ===
 
 fun version_setup(): Scenario {
