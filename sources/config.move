@@ -394,6 +394,32 @@ public fun set_launch_params(
     assert!(vb0 <= U64_MAX_U128, EInvalidLaunchParams);
     assert!(first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= 10_000, EInvalidLaunchParams);
     assert!(first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= 10_000, EInvalidLaunchParams);
+    // The TIME cap must STRICTLY bind, and the bound is not 10_000 bps.
+    //
+    // The caps are denominated in TOTAL supply, but only `initial_virtual_base`
+    // is ever purchasable -- `remain_base` is held back to seed the CLMM. So a
+    // cap at or above initial/(initial+remain) of supply covers everything that
+    // exists to buy and stops capping anything: `buy_internal` clamps to
+    // `min(sellable, budget)`, and once `budget >= sellable` the binding side
+    // flips to `sellable`.
+    //
+    // Those two sides are not interchangeable. When `budget` binds, the buy is
+    // clamped and the excess quote refunded -- the documented first-buy
+    // contract. When `sellable` binds, the clamp ALSO completes the curve and
+    // flips the phase, and because `create_token` runs the TIME leg before the
+    // TVL leg, a completion-capable TIME leg leaves the TVL leg to abort
+    // ENotTrading and take the whole launch with it. That leg is then neither
+    // clamped nor refunded, which is the contract broken rather than applied.
+    //
+    // Rejected here rather than handled there: the alternative at the pool end
+    // is to skip a requested first-buy and silently refund it, which is the
+    // behaviour `dce5438` removed. Only the TIME cap needs this -- the TVL leg
+    // runs last, so a TVL leg that completes the curve forecloses nothing.
+    assert!(
+        ((initial_virtual_base as u128) + (remain_base as u128))
+            * (first_buy_time_cap_bps as u128) / 10_000 < (initial_virtual_base as u128),
+        EInvalidLaunchParams,
+    );
     // Base decimals are locked at the platform standard: `pool::seal` hard-codes
     // 9, so any other value would abort every future launch (EDecimalsMismatch).
     assert!(base_decimals == 9, EInvalidLaunchParams);

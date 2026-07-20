@@ -211,6 +211,56 @@ fun set_launch_params_rejects_overflowing_virtual_reserve() {
     scenario.end();
 }
 
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// The TIME first-buy cap is denominated in TOTAL supply, but only
+/// `initial_virtual_base` is purchasable -- `remain_base` seeds the CLMM. With
+/// I = 8e14 and R = 2e14 the sellable share is 80%, so 8000 bps buys out the
+/// entire float and the cap stops binding: the clamp in `buy_internal` flips
+/// from `budget` to `sellable`, which completes the curve instead of merely
+/// capping the buy. The TVL leg behind it then aborts ENotTrading and takes the
+/// launch with it -- neither clamped nor refunded. 7999 bps is accepted
+/// (`set_launch_params_accepts_a_cap_just_under_the_float`).
+fun set_launch_params_rejects_a_non_binding_time_cap() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 3, 8_000, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test]
+/// The bound is strict, not a round number: one bps below the sellable share
+/// still binds, so it is legal. Pins that the assert rejects exactly the
+/// non-binding range rather than some conservative margin above it.
+fun set_launch_params_accepts_a_cap_just_under_the_float() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 3, 7_999, 500,
+        );
+        assert!(cfg.first_buy_time_cap_bps() == 7_999);
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
 // === Tranche validation ===
 
 // The former `create_rejects_too_many_tranches`, `create_rejects_unknown_lock_kind`,

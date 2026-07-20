@@ -477,6 +477,15 @@ public fun new_sealed_base_for_testing<T: drop>(
 /// rising curve, so the order decides which leg gets the cheaper tokens, and
 /// it is fixed here rather than left to the caller.
 ///
+/// The order has a second, sharper consequence. Each leg is clamped to its
+/// per-kind base cap with the excess quote refunded, but `buy_internal` clamps
+/// to `min(sellable, budget)` — and if `sellable` is what binds, the clamp also
+/// completes the curve. A TIME leg large enough to do that would leave the TVL
+/// leg behind it aborting `ENotTrading`, taking the whole launch with it rather
+/// than being clamped and refunded. `config::set_launch_params` forbids that
+/// by requiring the TIME cap to stay strictly under the sellable float, so the
+/// clamp-and-refund contract holds on every path a launch can reach.
+///
 /// PTB callers should prefer `create_token_entry`, which takes the same
 /// requests as flat `Option<u64>` pairs. Reaching this function from a PTB
 /// means chaining `new_time_tranche_request` / `new_tvl_tranche_request` and

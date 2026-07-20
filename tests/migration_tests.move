@@ -825,8 +825,13 @@ fun setup_above_crossover(): (Scenario, Clock, mocks::CetusEnv) {
             200,
             24 * 60 * 60 * 1000,
             3,
-            10_000,
-            10_000,
+            // Production cap defaults. This launch takes no creator first-buy,
+            // so the caps never bind here; the uncapped 10_000/10_000 this used
+            // to carry was copied from `init_for_testing` and is now illegal
+            // anyway (10_000 bps of supply exceeds the 80% sellable float, so
+            // the TIME cap would stop binding).
+            300,
+            500,
         );
         config::add_quote<MOCK_QUOTE>(
             &admin_cap,
