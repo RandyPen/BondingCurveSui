@@ -382,7 +382,8 @@ fun create_rejects_tvl_target_below_minimum() {
 fun oversized_first_buy_clamps_to_cap() {
     let (mut scenario, mut clock) = setup();
     clock.set_for_testing(1_000);
-    // Enable the caps (time 3%, tvl 5%); the test config defaults to no cap.
+    // Install the production 3%/5% SPLIT; the fixture caps both kinds at 5%,
+    // so only this makes the two budgets distinguishable.
     scenario.next_tx(ADMIN);
     {
         let admin_cap = scenario.take_from_sender<AdminCap>();
@@ -930,10 +931,22 @@ fun first_buy_caps_are_independent_and_stack() {
         option::some(pool::new_tvl_tranche_request(OVERSIZED_BUY, 50_000_000_000)),
         2 * OVERSIZED_BUY,
     );
+    // The TVL leg's event, asserted for the same reason as the TIME leg's in
+    // `oversized_first_buy_clamps_to_cap`: `quote_in` is the actual spend after
+    // the cap refund, and a regression to the gross offered would otherwise
+    // fail nothing. This leg is the riskier of the two — it runs SECOND, so it
+    // prices against reserves the TIME leg already moved. Read before the next
+    // `next_tx`, while still inside the launch tx.
+    let events =
+        sui::event::events_by_type<pool::TvlTrancheLockedEvent<ZZZ_BASE, MOCK_QUOTE>>();
+    assert!(events.length() == 1);
+    let (tvl_quote_spent, tvl_base_locked) = pool::tvl_tranche_locked_event_amounts(&events[0]);
+    assert!(tvl_quote_spent < OVERSIZED_BUY); // clamped, so strictly under gross
+    assert!(tvl_base_locked == MAX_TVL_BASE);
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        // Each kind fills its own budget, in its own vector.
+        // Each kind fills its own budget, independently of the other.
         assert!(pool.time_tranche_exists());
         assert!(pool.tvl_tranche_exists());
         let (_, locked0, _) = pool.time_tranche_info();
