@@ -506,38 +506,16 @@ fun sell_blocked_after_completion() {
     end(scenario, clock, currency);
 }
 
-#[test]
-fun creator_tranches_can_drain_whole_curve() {
-    let (mut scenario, mut clock) = setup();
-    clock.set_for_testing(1_000);
-    // Single tranche paying enough gross to complete the curve.
-    let currency = create_test_token(
-        &mut scenario,
-        &clock,
-        option::some(pool::new_time_tranche_request(4_000_000_000, 1_000 + MIN_LOCK_MS)),
-        option::none(),
-        4_000_000_000,
-    );
-    // The completing tranche buy leaves change: the event must report
-    // the actual spend (~threshold + 1% fee), not the gross budget.
-    let events =
-        sui::event::events_by_type<pool::TimeTrancheLockedEvent<ZZZ_BASE, MOCK_QUOTE>>();
-    assert!(events.length() == 1);
-    let (quote_spent, base_locked) = pool::time_tranche_locked_event_amounts(&events[0]);
-    assert!(quote_spent < 4_000_000_000);
-    assert!(quote_spent >= THRESHOLD);
-    assert!(base_locked == I);
-
-    scenario.next_tx(CREATOR);
-    {
-        let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
-        assert!(pool.phase() == pool::phase_completed());
-        let (_, locked, _) = pool.time_tranche_info();
-        assert!(locked == I); // creator locked the whole sellable supply
-        ts::return_shared(pool);
-    };
-    end(scenario, clock, currency);
-}
+// The former `creator_tranches_can_drain_whole_curve` test was removed. It
+// launched a single TIME tranche large enough to buy out the curve, which
+// `set_launch_params` now forbids: the time cap must stay strictly under the
+// sellable float, so no admin-set config lets a first-buy reach completion.
+// The test only still passed because `init_for_testing` builds the config
+// struct directly and bypasses that assert -- it documented a shape production
+// cannot reach. What it actually covered survives elsewhere: the clamp, the
+// refund and the event reporting actual spend rather than gross are pinned by
+// `hardening_tests::oversized_first_buy_clamps_to_cap`, and a completing buy
+// (via the public path, where it belongs) by the migration suite.
 
 // === Pause ===
 
