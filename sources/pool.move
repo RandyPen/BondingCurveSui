@@ -477,14 +477,12 @@ public fun new_sealed_base_for_testing<T: drop>(
 /// rising curve, so the order decides which leg gets the cheaper tokens, and
 /// it is fixed here rather than left to the caller.
 ///
-/// The order has a second, sharper consequence. Each leg is clamped to its
-/// per-kind base cap with the excess quote refunded, but `buy_internal` clamps
-/// to `min(sellable, budget)` — and if `sellable` is what binds, the clamp also
-/// completes the curve. A TIME leg large enough to do that would leave the TVL
-/// leg behind it aborting `ENotTrading`, taking the whole launch with it rather
-/// than being clamped and refunded. `config::set_launch_params` forbids that
-/// by requiring the TIME cap to stay strictly under the sellable float, so the
-/// clamp-and-refund contract holds on every path a launch can reach.
+/// Each leg is clamped to its per-kind base cap with the excess quote refunded.
+/// That holds on every reachable path only because `config`'s
+/// `MAX_FIRST_BUY_CAP_BPS` keeps both caps clear of the sellable float — see
+/// there for why a cap that reaches the float stops capping and starts
+/// completing the curve instead, and why the leg order above makes that worse
+/// for the TIME leg than for the TVL one.
 ///
 /// PTB callers should prefer `create_token_entry`, which takes the same
 /// requests as flat `Option<u64>` pairs. Reaching this function from a PTB
@@ -872,7 +870,9 @@ fun tranche_buy<Base, Quote>(
     let creator = pool.creator;
     // The buy is clamped to the budget; any quote beyond what fits under the
     // cap is returned to the creator as change (rather than aborting the whole
-    // launch). TIME and TVL budgets are separate, so the two kinds stack.
+    // launch). TIME and TVL budgets are separate, and `MAX_FIRST_BUY_CAP_BPS`
+    // keeps their sum clear of the sellable float, so the two kinds stack
+    // without competing for it.
     let (locked, change) =
         // Creator first-buys are never referred.
         buy_internal(

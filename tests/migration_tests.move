@@ -827,9 +827,8 @@ fun setup_above_crossover(): (Scenario, Clock, mocks::CetusEnv) {
             3,
             // Production cap defaults. This launch takes no creator first-buy,
             // so the caps never bind here; the uncapped 10_000/10_000 this used
-            // to carry was copied from `init_for_testing` and is now illegal
-            // anyway (10_000 bps of supply exceeds the 80% sellable float, so
-            // the TIME cap would stop binding).
+            // to carry was copied from `init_for_testing` and now exceeds
+            // `MAX_FIRST_BUY_CAP_BPS` anyway.
             300,
             500,
         );

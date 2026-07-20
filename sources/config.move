@@ -45,6 +45,27 @@ const MAX_REFERRAL_BPS: u64 = 1_000;
 /// Upper bound on initial_virtual_base / remain_base (see
 /// set_launch_params).
 const MAX_INITIAL_TO_REMAIN_RATIO: u64 = 1_000;
+/// Ceiling on EACH per-kind creator first-buy cap, in bps of TOTAL supply.
+///
+/// A first-buy is clamped to its cap with the excess quote refunded, but
+/// `pool::buy_internal` clamps to `min(sellable, budget)` and only the `budget`
+/// side is a pure clamp -- when `sellable` binds, the clamp also completes the
+/// curve and flips the phase. So the caps must stay clear of the sellable
+/// float, or a first-buy stops being capped and starts graduating the pool at
+/// birth (and, for the TIME leg which runs first, strands any TVL leg behind it
+/// on ENotTrading, aborting the launch).
+///
+/// This ceiling makes that unreachable arithmetically rather than by a relation
+/// anyone has to re-derive: both kinds together can draw at most 2 x 500 bps =
+/// 10% of total supply, while `initial_virtual_base > remain_base` (asserted in
+/// set_launch_params) puts the sellable float above 50% of supply. The margin is
+/// at least 5x for EVERY legal supply split, so it holds without depending on
+/// the I/R ratio, on u128 truncation, or on which leg executes first.
+///
+/// Consequence: 500 is a hard ceiling, not a default. The shipped defaults (300
+/// time / 500 tvl) sit at or under it, and raising either past 5% needs a
+/// package upgrade, not a config call.
+const MAX_FIRST_BUY_CAP_BPS: u64 = 500;
 /// Floor on the CLMM base leg: 1 whole token at the platform's 9 decimals.
 /// Migration cannot be paused and a COMPLETED pool has no exit, so a launch
 /// that seeds a degenerate CLMM position strands its raise forever. Three
@@ -392,32 +413,15 @@ public fun set_launch_params(
     let denom = (initial_virtual_base - remain_base) as u128;
     let vb0 = (initial_virtual_base as u128) * (initial_virtual_base as u128) / denom;
     assert!(vb0 <= U64_MAX_U128, EInvalidLaunchParams);
-    assert!(first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= 10_000, EInvalidLaunchParams);
-    assert!(first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= 10_000, EInvalidLaunchParams);
-    // The TIME cap must STRICTLY bind, and the bound is not 10_000 bps.
-    //
-    // The caps are denominated in TOTAL supply, but only `initial_virtual_base`
-    // is ever purchasable -- `remain_base` is held back to seed the CLMM. So a
-    // cap at or above initial/(initial+remain) of supply covers everything that
-    // exists to buy and stops capping anything: `buy_internal` clamps to
-    // `min(sellable, budget)`, and once `budget >= sellable` the binding side
-    // flips to `sellable`.
-    //
-    // Those two sides are not interchangeable. When `budget` binds, the buy is
-    // clamped and the excess quote refunded -- the documented first-buy
-    // contract. When `sellable` binds, the clamp ALSO completes the curve and
-    // flips the phase, and because `create_token` runs the TIME leg before the
-    // TVL leg, a completion-capable TIME leg leaves the TVL leg to abort
-    // ENotTrading and take the whole launch with it. That leg is then neither
-    // clamped nor refunded, which is the contract broken rather than applied.
-    //
-    // Rejected here rather than handled there: the alternative at the pool end
-    // is to skip a requested first-buy and silently refund it, which is the
-    // behaviour `dce5438` removed. Only the TIME cap needs this -- the TVL leg
-    // runs last, so a TVL leg that completes the curve forecloses nothing.
+    // Both caps are ceilinged so that neither leg alone, nor the two together,
+    // can reach the sellable float -- see MAX_FIRST_BUY_CAP_BPS for why that
+    // has to hold and why a flat ceiling is enough to guarantee it.
     assert!(
-        ((initial_virtual_base as u128) + (remain_base as u128))
-            * (first_buy_time_cap_bps as u128) / 10_000 < (initial_virtual_base as u128),
+        first_buy_time_cap_bps > 0 && first_buy_time_cap_bps <= MAX_FIRST_BUY_CAP_BPS,
+        EInvalidLaunchParams,
+    );
+    assert!(
+        first_buy_tvl_cap_bps > 0 && first_buy_tvl_cap_bps <= MAX_FIRST_BUY_CAP_BPS,
         EInvalidLaunchParams,
     );
     // Base decimals are locked at the platform standard: `pool::seal` hard-codes

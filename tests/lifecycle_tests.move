@@ -508,14 +508,17 @@ fun sell_blocked_after_completion() {
 
 // The former `creator_tranches_can_drain_whole_curve` test was removed. It
 // launched a single TIME tranche large enough to buy out the curve, which
-// `set_launch_params` now forbids: the time cap must stay strictly under the
-// sellable float, so no admin-set config lets a first-buy reach completion.
-// The test only still passed because `init_for_testing` builds the config
-// struct directly and bypasses that assert -- it documented a shape production
-// cannot reach. What it actually covered survives elsewhere: the clamp, the
-// refund and the event reporting actual spend rather than gross are pinned by
-// `hardening_tests::oversized_first_buy_clamps_to_cap`, and a completing buy
-// (via the public path, where it belongs) by the migration suite.
+// `MAX_FIRST_BUY_CAP_BPS` now forbids: each per-kind cap is ceilinged at 5% of
+// total supply, so the two together draw at most 10% while the sellable float
+// is always above 50% (I > R). No admin-set config lets a first-buy of either
+// kind reach completion. The test only still passed because `init_for_testing`
+// builds the config struct directly and bypasses `set_launch_params` -- it
+// documented a shape production cannot reach.
+//
+// Its coverage moved to `hardening_tests::oversized_first_buy_clamps_to_cap`,
+// which now asserts the clamp, the refund AND the locked event reporting actual
+// spend rather than gross. A buy that completes the curve is covered on the
+// public path, where it belongs, by the migration suite.
 
 // === Pause ===
 

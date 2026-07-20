@@ -212,15 +212,12 @@ fun set_launch_params_rejects_overflowing_virtual_reserve() {
 }
 
 #[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
-/// The TIME first-buy cap is denominated in TOTAL supply, but only
-/// `initial_virtual_base` is purchasable -- `remain_base` seeds the CLMM. With
-/// I = 8e14 and R = 2e14 the sellable share is 80%, so 8000 bps buys out the
-/// entire float and the cap stops binding: the clamp in `buy_internal` flips
-/// from `budget` to `sellable`, which completes the curve instead of merely
-/// capping the buy. The TVL leg behind it then aborts ENotTrading and takes the
-/// launch with it -- neither clamped nor refunded. 7999 bps is accepted
-/// (`set_launch_params_accepts_a_cap_just_under_the_float`).
-fun set_launch_params_rejects_a_non_binding_time_cap() {
+/// Each per-kind first-buy cap is ceilinged at 5% of total supply, so that the
+/// two together (10%) stay clear of the sellable float (always > 50% of supply,
+/// since I > R). Without that, a cap large enough to reach the float stops
+/// capping: `buy_internal` clamps to `min(sellable, budget)` and the `sellable`
+/// side does not merely clamp, it completes the curve.
+fun set_launch_params_rejects_an_over_ceiling_time_cap() {
     let (mut scenario, clock) = setup();
     scenario.next_tx(ADMIN);
     {
@@ -229,7 +226,31 @@ fun set_launch_params_rejects_a_non_binding_time_cap() {
         config::set_launch_params(
             &admin_cap, &mut cfg, 9,
             800_000_000_000_000, 200_000_000_000_000,
-            200, MIN_LOCK_MS, 3, 8_000, 500,
+            200, MIN_LOCK_MS, 3, 501, 500,
+        );
+        scenario.return_to_sender(admin_cap);
+        ts::return_shared(cfg);
+    };
+    clock.destroy_for_testing();
+    scenario.end();
+}
+
+#[test, expected_failure(abort_code = config::EInvalidLaunchParams)]
+/// The ceiling applies to the TVL cap too, not just TIME. This is the case an
+/// earlier TIME-only bound let through: the TVL leg runs last so it aborts
+/// nothing, but a TVL cap reaching the float graduates the pool inside
+/// `create_token` with the entire float locked to the creator -- a silently
+/// different product rather than a failure.
+fun set_launch_params_rejects_an_over_ceiling_tvl_cap() {
+    let (mut scenario, clock) = setup();
+    scenario.next_tx(ADMIN);
+    {
+        let admin_cap = scenario.take_from_sender<AdminCap>();
+        let mut cfg = scenario.take_shared<LaunchpadConfig>();
+        config::set_launch_params(
+            &admin_cap, &mut cfg, 9,
+            800_000_000_000_000, 200_000_000_000_000,
+            200, MIN_LOCK_MS, 3, 300, 501,
         );
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
@@ -239,10 +260,10 @@ fun set_launch_params_rejects_a_non_binding_time_cap() {
 }
 
 #[test]
-/// The bound is strict, not a round number: one bps below the sellable share
-/// still binds, so it is legal. Pins that the assert rejects exactly the
-/// non-binding range rather than some conservative margin above it.
-fun set_launch_params_accepts_a_cap_just_under_the_float() {
+/// The shipped defaults sit exactly at the ceiling (tvl) and under it (time),
+/// so the bound is tight rather than generous -- pins that a routine
+/// re-application of the production params is still legal.
+fun set_launch_params_accepts_the_production_defaults() {
     let (mut scenario, clock) = setup();
     scenario.next_tx(ADMIN);
     {
@@ -251,9 +272,10 @@ fun set_launch_params_accepts_a_cap_just_under_the_float() {
         config::set_launch_params(
             &admin_cap, &mut cfg, 9,
             800_000_000_000_000, 200_000_000_000_000,
-            200, MIN_LOCK_MS, 3, 7_999, 500,
+            200, MIN_LOCK_MS, 3, 300, 500,
         );
-        assert!(cfg.first_buy_time_cap_bps() == 7_999);
+        assert!(cfg.first_buy_time_cap_bps() == 300);
+        assert!(cfg.first_buy_tvl_cap_bps() == 500);
         scenario.return_to_sender(admin_cap);
         ts::return_shared(cfg);
     };
@@ -387,6 +409,17 @@ fun oversized_first_buy_clamps_to_cap() {
     // change exceeds the 100_000 of slack in the payment, so quote from the
     // tranche's own gross came back rather than being kept by the pool.
     assert!(change > 100_000);
+    // The event must report the ACTUAL spend, not the gross the caller offered.
+    // `quote_in` is `gross - change`, and this is the field indexers read to
+    // attribute creator spend -- a regression to `gross` would otherwise fail
+    // nothing, since no other test in the suite reads a tranche-locked event.
+    // Must run before the next `next_tx`, while still inside the launch tx.
+    let events =
+        sui::event::events_by_type<pool::TimeTrancheLockedEvent<ZZZ_BASE, MOCK_QUOTE>>();
+    assert!(events.length() == 1);
+    let (quote_spent, base_locked) = pool::time_tranche_locked_event_amounts(&events[0]);
+    assert!(quote_spent < 2_000_000_000); // the gross offered
+    assert!(base_locked == MAX_TIME_BASE);
     scenario.next_tx(CREATOR);
     {
         let pool = scenario.take_shared<Pool<ZZZ_BASE, MOCK_QUOTE>>();
