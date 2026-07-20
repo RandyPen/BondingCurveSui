@@ -326,7 +326,13 @@ public struct TradedEvent<phantom Base, phantom Quote> has copy, drop {
     pool_id: ID,
     trader: address,
     is_buy: bool,
-    /// Net quote moved through the curve (fee excluded).
+    /// Quote that moved in or out of `quote_reserve` — the curve's own side of
+    /// the trade. `fee` is NOT a component of it in the same direction on both
+    /// legs, so a trader's actual cash flow is not `quote_amount` alone:
+    ///   buy:  trader pays `quote_amount + fee` (fee charged on top of the
+    ///         amount that reaches the reserve)
+    ///   sell: trader receives `quote_amount - fee` (fee taken out of the
+    ///         amount the reserve released)
     quote_amount: u64,
     base_amount: u64,
     fee: u64,
